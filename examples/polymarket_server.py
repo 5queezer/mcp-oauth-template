@@ -22,7 +22,15 @@ from mcp_server import create_app, StaticPasswordProvider
 # MCP Tools
 # ---------------------------------------------------------------------------
 
-mcp = fastmcp.FastMCP("polymarket")
+mcp = fastmcp.FastMCP(
+    "polymarket",
+    instructions=(
+        "Query live Polymarket prediction markets. "
+        "Use get_hormuz_markets() for Iran/Hormuz/oil thesis markets, "
+        "search_markets(keyword) to find any topic, "
+        "get_market_by_slug(slug) for a specific market by its URL slug."
+    ),
+)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 HORMUZ_KEYWORDS = ["iran", "hormuz", "wti", "oil", "militar", "sanction", "crude"]

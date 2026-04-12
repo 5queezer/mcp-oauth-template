@@ -76,6 +76,7 @@ def create_app(
     provider=None,
     base_url: str | None = None,
     title: str = "MCP OAuth Server",
+    instructions: str | None = None,
 ) -> FastAPI:
     """
     App factory. Wires together:
@@ -84,17 +85,20 @@ def create_app(
       - CORS for claude.ai
 
     Args:
-        mcp:       fastmcp.FastMCP instance. If None, a stub is used.
-        provider:  AuthProvider instance. Defaults to env-driven selection.
-        base_url:  Public URL used in OAuth metadata.
-                   Falls back to BASE_URL env var, then http://localhost:8080.
-        title:     OpenAPI / service title.
+        mcp:          fastmcp.FastMCP instance. If None, a stub is used.
+        provider:     AuthProvider instance. Defaults to env-driven selection.
+        base_url:     Public URL used in OAuth metadata.
+                      Falls back to BASE_URL env var, then http://localhost:8080.
+        title:        OpenAPI / service title.
+        instructions: Text shown as the server description card in claude.ai.
+                      Ignored when mcp is provided (set it on the FastMCP
+                      instance directly instead).
     """
     _base_url = base_url or os.getenv("BASE_URL", "http://localhost:8080")
     _provider = provider or _default_provider()
     _store = TokenStore()
     _client_store = ClientStore()
-    _mcp = mcp or _stub_mcp()
+    _mcp = mcp or _stub_mcp(instructions=instructions)
 
     app = FastAPI(title=title, docs_url="/docs", redoc_url=None)
 
@@ -147,10 +151,10 @@ def _default_provider():
     return SingleUserProvider()
 
 
-def _stub_mcp():
+def _stub_mcp(instructions: str | None = None):
     import fastmcp
 
-    mcp = fastmcp.FastMCP("stub")
+    mcp = fastmcp.FastMCP("stub", instructions=instructions)
 
     @mcp.tool()
     def ping() -> str:

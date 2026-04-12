@@ -38,7 +38,10 @@ pip install -r requirements.txt
 import fastmcp
 from mcp_server import create_app
 
-mcp = fastmcp.FastMCP("my-service")
+mcp = fastmcp.FastMCP(
+    "my-service",
+    instructions="Describe what your server does — shown as the connector card in claude.ai.",
+)
 
 @mcp.tool()
 def my_tool(query: str) -> str:
