@@ -1,6 +1,9 @@
 """
 MCP OAuth Server -- App Factory.
 
+Uses the FastMCP Starlette app as the root application and adds OAuth routes
+to it, so FastMCP's lifespan (session manager) works correctly.
+
 Usage:
   from mcp_server.app import create_app
   app = create_app()
@@ -21,54 +24,17 @@ Or for a custom service:
 
 import os
 import logging
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from .auth import ClientStore, SingleUserProvider, StaticPasswordProvider, TokenStore
-from .oauth_routes import make_oauth_router
+from .oauth_routes import make_oauth_routes
 
 logger = logging.getLogger(__name__)
-
-
-class BearerMiddleware(BaseHTTPMiddleware):
-    """
-    Validates Bearer tokens on /mcp/* routes.
-    Passes through all other routes (OAuth endpoints, health).
-    401 responses include RFC 9728 resource_metadata so claude.ai can
-    discover the OAuth flow automatically.
-    """
-    PROTECTED_PREFIX = "/mcp"
-
-    def __init__(self, app, store: TokenStore, base_url: str):
-        super().__init__(app)
-        self._store = store
-        self._resource_metadata_url = f"{base_url.rstrip('/')}/.well-known/oauth-protected-resource"
-
-    async def dispatch(self, request: Request, call_next):
-        if not request.url.path.startswith(self.PROTECTED_PREFIX):
-            return await call_next(request)
-
-        auth = request.headers.get("authorization", "")
-        if not auth.lower().startswith("bearer "):
-            return JSONResponse(
-                {"error": "invalid_token", "error_description": "Bearer token required"},
-                status_code=401,
-                headers={"WWW-Authenticate": f'Bearer resource_metadata="{self._resource_metadata_url}"'},
-            )
-
-        token_str = auth[7:]
-        entry = self._store.validate_token(token_str)
-        if entry is None:
-            return JSONResponse(
-                {"error": "invalid_token", "error_description": "Token expired or unknown"},
-                status_code=401,
-                headers={"WWW-Authenticate": f'Bearer resource_metadata="{self._resource_metadata_url}"'},
-            )
-
-        return await call_next(request)
 
 
 def create_app(
@@ -77,9 +43,9 @@ def create_app(
     base_url: str | None = None,
     title: str = "MCP OAuth Server",
     instructions: str | None = None,
-) -> FastAPI:
+):
     """
-    App factory. Wires together:
+    App factory. Returns a Starlette app (from FastMCP) with:
       - OAuth 2.1 AS routes (/.well-known, /authorize, /token, /revoke)
       - MCP HTTP transport at /mcp (Bearer-protected via middleware)
       - CORS for claude.ai
@@ -100,36 +66,68 @@ def create_app(
     _client_store = ClientStore()
     _mcp = mcp or _stub_mcp(instructions=instructions)
 
-    app = FastAPI(title=title, docs_url="/docs", redoc_url=None)
+    resource_metadata_url = f"{_base_url.rstrip('/')}/.well-known/oauth-protected-resource"
 
-    # 1. CORS -- claude.ai requires this
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["https://claude.ai", "https://api.claude.ai"],
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
-        allow_credentials=True,
+    # Bearer middleware for /mcp (raw ASGI middleware)
+    class BearerMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http" or not scope["path"].startswith("/mcp"):
+                return await self.app(scope, receive, send)
+
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode()
+
+            if not auth_header.lower().startswith("bearer "):
+                resp = JSONResponse(
+                    {"error": "invalid_token", "error_description": "Bearer token required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": f'Bearer resource_metadata="{resource_metadata_url}"'},
+                )
+                return await resp(scope, receive, send)
+
+            token_str = auth_header[7:]
+            entry = _store.validate_token(token_str)
+            if entry is None:
+                resp = JSONResponse(
+                    {"error": "invalid_token", "error_description": "Token expired or unknown"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": f'Bearer resource_metadata="{resource_metadata_url}"'},
+                )
+                return await resp(scope, receive, send)
+
+            return await self.app(scope, receive, send)
+
+    # Build the MCP Starlette app with middleware baked in
+    app = _mcp.http_app(
+        path="/mcp",
+        middleware=[
+            Middleware(CORSMiddleware,
+                allow_origins=["https://claude.ai", "https://api.claude.ai"],
+                allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+                allow_headers=["Authorization", "Content-Type"],
+                allow_credentials=True,
+            ),
+            Middleware(BearerMiddleware),
+        ],
     )
 
-    # 2. Bearer enforcement on /mcp/*
-    app.add_middleware(BearerMiddleware, store=_store, base_url=_base_url)
-
-    # 3. OAuth 2.1 AS routes
-    oauth_router = make_oauth_router(
+    # Add OAuth routes and health to the MCP app's router
+    oauth_routes = make_oauth_routes(
         store=_store,
         client_store=_client_store,
         provider=_provider,
         base_url=_base_url,
     )
-    app.include_router(oauth_router)
 
-    # 4. MCP transport -- middleware handles auth, no extra deps needed
-    app.mount("/mcp", _mcp.http_app())
+    async def health(request: Request):
+        return JSONResponse({"status": "ok", "base_url": _base_url})
 
-    # 5. Health
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "base_url": _base_url}
+    for route in oauth_routes:
+        app.routes.insert(0, route)
+    app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
     logger.info("MCP OAuth server ready at %s", _base_url)
     return app

@@ -7,7 +7,7 @@ import base64
 import hashlib
 import secrets
 import pytest
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 
 from mcp_server.auth import (
     SingleUserProvider,
@@ -263,20 +263,17 @@ def test_mcp_requires_bearer(client):
     assert "resource_metadata" in www_auth
 
 
-def test_mcp_with_valid_token(client):
+def test_mcp_with_expired_token(client):
+    """Expired/revoked tokens must be rejected with 401."""
     token = _full_pkce_flow(client)
+    # Revoke the token first
+    client.post("/revoke", data=f"token={token}")
     resp = client.post(
         "/mcp",
         headers={"Authorization": f"Bearer {token}"},
-        json={
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {"name": "ping", "arguments": {}},
-            "id": 1,
-        },
+        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
     )
-    # MCP might return 404 for unrecognized route shape, but NOT 401
-    assert resp.status_code != 401
+    assert resp.status_code == 401
 
 
 def test_code_single_use(client):
