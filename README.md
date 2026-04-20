@@ -120,27 +120,29 @@ class GoogleAuthProvider(AuthProvider):
 
 ## OAuth 2.1 Flow (what claude.ai does)
 
-```
-claude.ai                    your MCP server
-   │                              │
-   │  GET /.well-known/...        │  ← Discovery
-   │──────────────────────────────▶│
-   │                              │
-   │  GET /authorize              │
-   │  ?code_challenge=<S256>      │  ← PKCE challenge
-   │──────────────────────────────▶│
-   │  302 → redirect_uri?code=X   │
-   │◀──────────────────────────────│
-   │                              │
-   │  POST /token                 │
-   │  code=X + code_verifier      │  ← PKCE verify
-   │──────────────────────────────▶│
-   │  { access_token: "..." }     │
-   │◀──────────────────────────────│
-   │                              │
-   │  POST /mcp                   │
-   │  Authorization: Bearer ...   │  ← All tool calls
-   │──────────────────────────────▶│
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as claude.ai
+    participant S as your MCP server
+
+    Note over C,S: Discovery
+    C->>S: GET /.well-known/oauth-authorization-server
+    S-->>C: AS metadata (issuer, endpoints, PKCE=S256)
+
+    Note over C,S: PKCE challenge
+    C->>S: GET /authorize?code_challenge=<S256>&redirect_uri=…
+    S-->>C: 302 redirect_uri?code=X
+
+    Note over C,S: PKCE verify
+    C->>S: POST /token  (code=X, code_verifier)
+    S-->>C: { access_token }
+
+    Note over C,S: Tool calls
+    loop each tool invocation
+        C->>S: POST /mcp  (Authorization: Bearer …)
+        S-->>C: tool result
+    end
 ```
 
 ---
