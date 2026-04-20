@@ -120,6 +120,7 @@ def create_app(
         client_store=_client_store,
         provider=_provider,
         base_url=_base_url,
+        title=title,
     )
 
     async def health(request: Request):

@@ -14,10 +14,11 @@ import logging
 from urllib.parse import parse_qs
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from .auth import AuthProvider, ClientStore, TokenStore, verify_pkce
+from .templates import render_login
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def make_oauth_routes(
     provider: AuthProvider,
     base_url: str,
     scopes_supported: list[str] | None = None,
+    title: str = "MCP OAuth Server",
 ) -> list[Route]:
     scopes = scopes_supported or ["mcp:tools"]
     base_url = base_url.rstrip("/")
@@ -89,13 +91,21 @@ def make_oauth_routes(
         }, status_code=201)
 
     async def authorize(request: Request):
-        params = request.query_params
-        response_type = params.get("response_type", "code")
-        client_id = params.get("client_id", "")
-        code_challenge = params.get("code_challenge", "")
-        code_challenge_method = params.get("code_challenge_method", "S256")
-        redirect_uri = params.get("redirect_uri", "")
-        state = params.get("state", "")
+        if request.method == "POST":
+            form = await request.form()
+            creds: dict[str, str] = {
+                **{k: v for k, v in request.query_params.items()},
+                **{k: str(v) for k, v in form.items()},
+            }
+        else:
+            creds = dict(request.query_params)
+
+        response_type = creds.get("response_type", "code")
+        client_id = creds.get("client_id", "")
+        code_challenge = creds.get("code_challenge", "")
+        code_challenge_method = creds.get("code_challenge_method", "S256")
+        redirect_uri = creds.get("redirect_uri", "")
+        state = creds.get("state", "")
 
         if response_type != "code":
             return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
@@ -116,12 +126,14 @@ def make_oauth_routes(
                     status_code=400,
                 )
 
-        sub = provider.authenticate(request)
+        sub = provider.authenticate(request, creds)
         if sub is None:
-            return JSONResponse(
-                {"error": "authentication_required"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+            # Render the login page. On POST, show a generic error so we don't
+            # leak whether the password was wrong vs. the provider refused.
+            error = "Invalid password" if request.method == "POST" else None
+            return HTMLResponse(
+                render_login(title=title, params=creds, error=error),
+                status_code=200,
             )
 
         code = store.create_code(
@@ -183,7 +195,7 @@ def make_oauth_routes(
         Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
         Route("/register", register, methods=["POST"]),
-        Route("/authorize", authorize, methods=["GET"]),
+        Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
         Route("/revoke", revoke, methods=["POST"]),
     ]

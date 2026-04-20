@@ -99,7 +99,7 @@ app = create_app(
 )
 ```
 
-Set `ADMIN_PASSWORD` env var on Cloud Run. The `/authorize` URL will include `?password=...` which claude.ai passes through.
+Set `ADMIN_PASSWORD` env var on Cloud Run. claude.ai redirects the user's browser to `/authorize`; the server renders a password form; after submit, the OAuth code is issued and the PKCE flow completes.
 
 ### Multi-user (upstream OAuth)
 
@@ -110,9 +110,10 @@ from mcp_server.auth import AuthProvider
 from starlette.requests import Request
 
 class GoogleAuthProvider(AuthProvider):
-    def authenticate(self, request: Request) -> str | None:
-        # Check session, JWT, or upstream OAuth token
-        # Return user sub or None
+    def authenticate(self, request: Request, credentials: dict[str, str]) -> str | None:
+        # `request` gives access to headers/cookies for session-based auth.
+        # `credentials` merges /authorize query params + POST form fields.
+        # Return user sub or None.
         ...
 ```
 
@@ -132,7 +133,13 @@ sequenceDiagram
 
     Note over C,S: PKCE challenge
     C->>S: GET /authorize?code_challenge=<S256>&redirect_uri=…
-    S-->>C: 302 redirect_uri?code=X
+    alt password required (StaticPasswordProvider)
+        S-->>C: 200 HTML login form
+        C->>S: POST /authorize (password + hidden PKCE fields)
+        S-->>C: 302 redirect_uri?code=X
+    else no password (SingleUserProvider)
+        S-->>C: 302 redirect_uri?code=X
+    end
 
     Note over C,S: PKCE verify
     C->>S: POST /token  (code=X, code_verifier)

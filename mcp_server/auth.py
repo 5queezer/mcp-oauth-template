@@ -61,8 +61,23 @@ class AuthProvider(ABC):
     """
 
     @abstractmethod
-    def authenticate(self, request: Request) -> Optional[str]:
-        """Return subject (user id / name) or None if auth fails."""
+    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
+        """
+        Return subject (user id / name) or None if auth fails.
+
+        Args:
+            request:     The underlying Starlette Request. Advanced providers
+                         may read headers, cookies, or upstream session state
+                         from this to make auth decisions.
+            credentials: Merged dict of /authorize query params plus any POST
+                         form fields (e.g. "password"). Simple providers can
+                         look at this alone.
+
+        Example (upstream OAuth / session cookie):
+            def authenticate(self, request, credentials):
+                sess = request.cookies.get("session")
+                return self._resolve_session(sess)
+        """
         ...
 
 
@@ -72,20 +87,21 @@ class SingleUserProvider(AuthProvider):
     Safe when your Cloud Run service is not publicly guessable
     or you protect /authorize with VPN / IP allowlist.
     """
-    def authenticate(self, request: Request) -> Optional[str]:
+    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
         return "local-user"
 
 
 class StaticPasswordProvider(AuthProvider):
     """
-    Reads ADMIN_PASSWORD from env. Expects ?password=... query param.
+    Password-gated single-user mode. On GET /authorize the server renders a
+    password form; the submitted password is passed in `credentials`.
     Good for single-user deployments that want minimal friction.
     """
     def __init__(self, password: str):
         self._password = password
 
-    def authenticate(self, request: Request) -> Optional[str]:
-        provided = request.query_params.get("password", "")
+    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
+        provided = credentials.get("password", "")
         if secrets.compare_digest(provided, self._password):
             return "admin"
         return None
