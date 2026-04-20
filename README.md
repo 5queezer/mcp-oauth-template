@@ -142,12 +142,13 @@ for a complete, working GitHub implementation (`whoami`, `list_my_repos`,
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as claude.ai
+    participant C as claude.ai / browser
     participant S as your MCP server
+    participant I as upstream IdP — e.g. GitHub
 
     Note over C,S: Discovery
     C->>S: GET /.well-known/oauth-authorization-server
-    S-->>C: AS metadata (issuer, endpoints, PKCE=S256)
+    S-->>C: AS metadata — issuer, endpoints, PKCE=S256
 
     Note over C,S: PKCE challenge
     C->>S: GET /authorize?code_challenge=S256&redirect_uri=…
@@ -156,8 +157,13 @@ sequenceDiagram
         C->>S: POST /authorize — password + hidden PKCE fields
         S-->>C: 302 redirect_uri?code=X
     else upstream OAuth — challenge hook
-        S-->>C: 302 github.com/login/oauth/authorize
-        C->>S: GET /auth/github/callback?code=Y&state=Z
+        S-->>C: 302 to IdP authorize URL
+        C->>I: GET /login/oauth/authorize
+        Note over C,I: user logs in + approves
+        I-->>C: 302 /auth/github/callback?code=Y
+        C->>S: GET /auth/github/callback?code=Y
+        S->>I: POST /login/oauth/access_token
+        I-->>S: access_token
         S-->>C: 302 /authorize — Set-Cookie mcp_session
         C->>S: GET /authorize + Cookie
         S-->>C: 302 redirect_uri?code=X
