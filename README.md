@@ -150,27 +150,28 @@ sequenceDiagram
     S-->>C: AS metadata (issuer, endpoints, PKCE=S256)
 
     Note over C,S: PKCE challenge
-    C->>S: GET /authorize?code_challenge=<S256>&redirect_uri=…
-    alt password required (StaticPasswordProvider)
+    C->>S: GET /authorize?code_challenge=S256&redirect_uri=…
+    alt password required — StaticPasswordProvider
         S-->>C: 200 HTML login form
-        C->>S: POST /authorize (password + hidden PKCE fields)
+        C->>S: POST /authorize — password + hidden PKCE fields
         S-->>C: 302 redirect_uri?code=X
-    else upstream OAuth redirect (challenge())
+    else upstream OAuth — challenge hook
         S-->>C: 302 github.com/login/oauth/authorize
-        C->>S: GET /auth/github/callback?code=Y&state=…
-        S-->>C: 302 Set-Cookie; /authorize (re-enter flow with session)
+        C->>S: GET /auth/github/callback?code=Y&state=Z
+        S-->>C: 302 /authorize — Set-Cookie mcp_session
+        C->>S: GET /authorize + Cookie
         S-->>C: 302 redirect_uri?code=X
-    else no password (SingleUserProvider)
+    else no password — SingleUserProvider
         S-->>C: 302 redirect_uri?code=X
     end
 
     Note over C,S: PKCE verify
-    C->>S: POST /token  (code=X, code_verifier)
-    S-->>C: { access_token }
+    C->>S: POST /token — code=X + code_verifier
+    S-->>C: access_token
 
     Note over C,S: Tool calls
     loop each tool invocation
-        C->>S: POST /mcp  (Authorization: Bearer …)
+        C->>S: POST /mcp — Authorization Bearer …
         S-->>C: tool result
     end
 ```
