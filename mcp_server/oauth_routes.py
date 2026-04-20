@@ -128,8 +128,15 @@ def make_oauth_routes(
 
         sub = provider.authenticate(request, creds)
         if sub is None:
-            # Render the login page. On POST, show a generic error so we don't
-            # leak whether the password was wrong vs. the provider refused.
+            # On initial GET with no credentials, let the provider offer a
+            # non-password challenge (e.g. redirect to an upstream IdP).
+            # On POST (the user just submitted the login form) we always
+            # fall through to re-render the form with a generic error so we
+            # don't leak whether the password was wrong vs. provider refused.
+            if request.method == "GET":
+                challenge_resp = provider.challenge(request, creds)
+                if challenge_resp is not None:
+                    return challenge_resp
             error = "Invalid password" if request.method == "POST" else None
             return HTMLResponse(
                 render_login(title=title, params=creds, error=error),

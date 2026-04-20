@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import Request
+from starlette.requests import Request
+from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,21 @@ class AuthProvider(ABC):
                 return self._resolve_session(sess)
         """
         ...
+
+    def challenge(self, request: Request, credentials: dict[str, str]) -> Optional[Response]:
+        """
+        Optional hook: produce a non-password challenge Response when
+        `authenticate` returned None on an initial GET /authorize.
+
+        Return a Response (typically a RedirectResponse to an upstream IdP)
+        to start an external login flow. Return None to let the caller fall
+        back to the built-in password login form.
+
+        Only invoked when the provider said "no session" and the request
+        is the initial GET with no submitted credentials — POST failures
+        keep showing the password form with an error.
+        """
+        return None
 
 
 class SingleUserProvider(AuthProvider):

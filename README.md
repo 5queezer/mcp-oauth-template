@@ -10,15 +10,18 @@ Build any MCP service in ~30 lines. Deploy to Cloud Run in one command.
 ```
 mcp_server/
   __init__.py        -- Public API
-  auth.py            -- PKCE + TokenStore + AuthProvider
+  auth.py            -- PKCE + TokenStore + AuthProvider (+ challenge hook)
   oauth_routes.py    -- OAuth 2.1 AS endpoints
   app.py             -- FastAPI factory (wires everything)
+  context.py         -- Per-request `current_sub` for tool code
 
 examples/
-  polymarket_server.py  -- Concrete example (Polymarket markets)
+  polymarket_server.py    -- No-auth example (Polymarket markets)
+  github_oauth_server.py  -- Per-user upstream OAuth (GitHub)
 
 tests/
-  test_oauth.py      -- Full PKCE flow + edge cases
+  test_oauth.py         -- Full PKCE flow + edge cases
+  test_github_oauth.py  -- GitHub provider + callback logic
 ```
 
 ---
@@ -117,6 +120,21 @@ class GoogleAuthProvider(AuthProvider):
         ...
 ```
 
+### Upstream OAuth (per-user identity)
+
+Each claude.ai user logs in through an external identity provider (GitHub,
+Google, etc.) and subsequent tool calls run with **their own** upstream
+token — not a shared one. The server maintains an allowlist of permitted
+users. Override `AuthProvider.challenge()` to redirect unauthenticated
+users to the IdP; your callback route exchanges the code for a token,
+sets a session cookie, and bounces the user back into `/authorize`. Tools
+read the caller's identity via `mcp_server.get_current_sub()` and look up
+the per-user token from a session store.
+
+See [`examples/github_oauth_server.py`](examples/github_oauth_server.py)
+for a complete, working GitHub implementation (`whoami`, `list_my_repos`,
+`get_starred` — each executes as the caller).
+
 ---
 
 ## OAuth 2.1 Flow (what claude.ai does)
@@ -136,6 +154,11 @@ sequenceDiagram
     alt password required (StaticPasswordProvider)
         S-->>C: 200 HTML login form
         C->>S: POST /authorize (password + hidden PKCE fields)
+        S-->>C: 302 redirect_uri?code=X
+    else upstream OAuth redirect (challenge())
+        S-->>C: 302 github.com/login/oauth/authorize
+        C->>S: GET /auth/github/callback?code=Y&state=…
+        S-->>C: 302 Set-Cookie; /authorize (re-enter flow with session)
         S-->>C: 302 redirect_uri?code=X
     else no password (SingleUserProvider)
         S-->>C: 302 redirect_uri?code=X

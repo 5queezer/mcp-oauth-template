@@ -32,6 +32,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .auth import ClientStore, SingleUserProvider, StaticPasswordProvider, TokenStore
+from .context import current_sub
 from .oauth_routes import make_oauth_routes
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,15 @@ def create_app(
                 )
                 return await resp(scope, receive, send)
 
-            return await self.app(scope, receive, send)
+            # Bind the caller's sub to the request's ContextVar so tools
+            # can look up who's calling via mcp_server.get_current_sub().
+            # Reset in finally to prevent the value leaking across requests
+            # that reuse this asyncio task.
+            ctx_token = current_sub.set(entry.sub)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                current_sub.reset(ctx_token)
 
     # Build the MCP Starlette app with middleware baked in
     app = _mcp.http_app(
