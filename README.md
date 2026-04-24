@@ -31,7 +31,7 @@ tests/
 ### 1. Install
 
 ```bash
-pip install -r requirements.txt
+uv pip install .
 ```
 
 ### 2. Build your MCP server
@@ -197,6 +197,6 @@ sequenceDiagram
 ## Tests
 
 ```bash
-pip install pytest httpx
+uv pip install '.[dev]'
 pytest tests/ -v
 ```
