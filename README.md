@@ -31,7 +31,7 @@ tests/
 ### 1. Install
 
 ```bash
-pip install .
+uv pip install .
 ```
 
 ### 2. Build your MCP server
@@ -197,6 +197,6 @@ sequenceDiagram
 ## Tests
 
 ```bash
-pip install '.[dev]'
+uv pip install '.[dev]'
 pytest tests/ -v
 ```
