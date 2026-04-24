@@ -31,7 +31,7 @@ tests/
 ### 1. Install
 
 ```bash
-pip install -r requirements.txt
+pip install .
 ```
 
 ### 2. Build your MCP server

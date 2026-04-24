@@ -3,8 +3,10 @@ FROM python:3.12-slim AS builder
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY mcp_server ./mcp_server
+RUN pip install --no-cache-dir .
 
 FROM python:3.12-slim
 
