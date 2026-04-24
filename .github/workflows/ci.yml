@@ -11,13 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v4
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
-        run: pip install .[dev]
+        run: uv pip install --system ".[dev]"
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

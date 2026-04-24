@@ -1,12 +1,12 @@
-FROM python:3.12-slim AS builder
+FROM astral/uv:python3.12-bookworm-slim AS builder
 
-RUN python -m venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY mcp_server ./mcp_server
-RUN pip install --no-cache-dir .
+RUN uv venv /opt/venv && \
+    uv pip install --python /opt/venv/bin/python --no-cache .
 
 FROM python:3.12-slim
 

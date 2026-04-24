@@ -197,6 +197,6 @@ sequenceDiagram
 ## Tests
 
 ```bash
-pip install pytest httpx
+pip install '.[dev]'
 pytest tests/ -v
 ```
