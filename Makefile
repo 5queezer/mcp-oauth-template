@@ -4,7 +4,7 @@ SERVICE_NAME ?= mcp-oauth-service
 REGION       ?= europe-west1
 
 install:
-	pip install -e ".[dev]"
+	uv pip install -e ".[dev]"
 
 test:
 	pytest tests/ -v --tb=short
