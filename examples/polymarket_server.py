@@ -1,166 +1,232 @@
-"""
-Polymarket MCP Server -- built on mcp-oauth-template.
+"""Read-only Polymarket market search MCP server.
 
-Deploy to Cloud Run:
-  gcloud run deploy polymarket-mcp \
-    --source . \
-    --region europe-west1 \
-    --set-env-vars BASE_URL=https://polymarket-mcp-xxxx.run.app
-
-Then add as MCP connector in claude.ai:
-  URL: https://polymarket-mcp-xxxx.run.app/mcp
+The tools use Polymarket's public Gamma API and do not place trades or require
+Polymarket credentials. Set ``MCP_AUTH_MODE=demo`` for an explicit local demo;
+the default server mode requires the GitHub OAuth configuration documented by
+the project.
 """
+
+from __future__ import annotations
 
 import json
-import os
+import math
+from collections.abc import Mapping
+from typing import Annotated, Any, cast
+from urllib.parse import quote
 
 import httpx
-import fastmcp
-from mcp_server import create_app, StaticPasswordProvider
+from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
+from pydantic import Field
+from starlette.applications import Starlette
 
-# ---------------------------------------------------------------------------
-# MCP Tools
-# ---------------------------------------------------------------------------
-
-mcp = fastmcp.FastMCP(
-    "polymarket",
-    instructions=(
-        "Query live Polymarket prediction markets. "
-        "Use get_hormuz_markets() for Iran/Hormuz/oil thesis markets, "
-        "search_markets(keyword) to find any topic, "
-        "get_market_by_slug(slug) for a specific market by its URL slug."
-    ),
-)
+from mcp_server import create_app
+from mcp_server.auth import auth_from_env
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-HORMUZ_KEYWORDS = ["iran", "hormuz", "wti", "oil", "militar", "sanction", "crude"]
+POLYMARKET_EVENT_URL = "https://polymarket.com/event"
+REQUEST_TIMEOUT_SECONDS = 10.0
+
+SearchLimit = Annotated[
+    int,
+    Field(ge=1, le=100, description="Maximum number of markets to return"),
+]
+SearchPage = Annotated[int, Field(ge=1, description="One-based search result page")]
+SearchQuery = Annotated[str, Field(min_length=1, description="Market search text")]
+MarketSlug = Annotated[str, Field(min_length=1, description="Exact Polymarket market slug")]
 
 
-@mcp.tool()
-def get_hormuz_markets() -> list[dict]:
-    """
-    Fetch active Polymarket markets relevant to the Hormuz thesis.
-    Filters by keywords: Iran, WTI, oil, military, sanctions.
-    """
-    with httpx.Client(timeout=10) as client:
-        resp = client.get(
-            f"{GAMMA_API}/markets",
-            params={"active": "true", "closed": "false", "limit": 100},
+async def _get_gamma(
+    path: str,
+    *,
+    params: dict[str, str | int | bool] | None = None,
+) -> Any:
+    async with httpx.AsyncClient(
+        base_url=GAMMA_API,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    ) as client:
+        response = await client.get(path, params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+def _decoded_list(raw: object, field_name: str) -> list[object]:
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Polymarket {field_name} is not valid JSON") from exc
+    else:
+        value = raw
+
+    if not isinstance(value, list):
+        raise ValueError(f"Polymarket {field_name} must be a list")
+    return cast("list[object]", value)
+
+
+def _outcome_prices(market: Mapping[str, object]) -> dict[str, float]:
+    outcomes = _decoded_list(market.get("outcomes"), "outcomes")
+    prices = _decoded_list(market.get("outcomePrices"), "outcomePrices")
+    if len(outcomes) != len(prices):
+        raise ValueError(
+            "Polymarket outcomes and outcomePrices must contain the same number of entries"
         )
-        resp.raise_for_status()
-        markets = resp.json()
 
-    results = []
-    for m in markets:
-        question = (m.get("question") or "").lower()
-        if any(kw in question for kw in HORMUZ_KEYWORDS):
-            prices = _parse_prices(m.get("outcomePrices", "[]"))
-            results.append({
-                "question": m.get("question"),
-                "yes_price": prices[0] if prices else None,
-                "no_price": prices[1] if len(prices) > 1 else None,
-                "volume_24h": m.get("volume24hr"),
-                "liquidity": m.get("liquidity"),
-                "end_date": m.get("endDate"),
-                "url": f"https://polymarket.com/market/{m.get('slug', '')}",
-            })
-
-    return sorted(results, key=lambda x: x["volume_24h"] or 0, reverse=True)
+    result: dict[str, float] = {}
+    for outcome, raw_price in zip(outcomes, prices, strict=True):
+        if not isinstance(outcome, str) or not outcome.strip():
+            raise ValueError("Polymarket outcomes must contain nonempty names")
+        if outcome in result:
+            raise ValueError(f"Polymarket returned a duplicate outcome: {outcome}")
+        if isinstance(raw_price, bool) or not isinstance(raw_price, str | int | float):
+            raise ValueError(f"Polymarket returned an invalid price for {outcome}")
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Polymarket returned an invalid price for {outcome}") from exc
+        if not math.isfinite(price):
+            raise ValueError(f"Polymarket returned a non-finite price for {outcome}")
+        result[outcome] = price
+    return result
 
 
-@mcp.tool()
-def search_markets(keyword: str, limit: int = 20) -> list[dict]:
-    """
-    Search active Polymarket markets by keyword.
-
-    Args:
-        keyword: Search term (e.g. 'fed rate', 'bitcoin', 'election')
-        limit:   Max results (default 20)
-    """
-    with httpx.Client(timeout=10) as client:
-        resp = client.get(
-            f"{GAMMA_API}/markets",
-            params={"active": "true", "closed": "false", "limit": 200},
-        )
-        resp.raise_for_status()
-        markets = resp.json()
-
-    kw = keyword.lower()
-    results = []
-    for m in markets:
-        if kw in (m.get("question") or "").lower():
-            prices = _parse_prices(m.get("outcomePrices", "[]"))
-            results.append({
-                "question": m.get("question"),
-                "yes_price": prices[0] if prices else None,
-                "no_price": prices[1] if len(prices) > 1 else None,
-                "volume_24h": m.get("volume24hr"),
-                "end_date": m.get("endDate"),
-            })
-            if len(results) >= limit:
-                break
-
-    return results
+def _required_text(record: Mapping[str, object], field_name: str) -> str:
+    value = record.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Polymarket result is missing {field_name}")
+    return value
 
 
-@mcp.tool()
-def get_market_by_slug(slug: str) -> dict:
-    """
-    Fetch a specific Polymarket market by its slug.
-    Slug is the URL path after /market/ on polymarket.com.
-
-    Args:
-        slug: e.g. 'will-wti-hit-120-in-april-2026'
-    """
-    with httpx.Client(timeout=10) as client:
-        resp = client.get(f"{GAMMA_API}/markets", params={"slug": slug})
-        resp.raise_for_status()
-        data = resp.json()
-
-    if not data:
-        return {"error": f"No market found for slug: {slug}"}
-
-    m = data[0]
-    prices = _parse_prices(m.get("outcomePrices", "[]"))
+def _market_summary(
+    market: Mapping[str, object],
+    *,
+    event_title: object,
+    event_slug: str,
+) -> dict[str, object]:
     return {
-        "question": m.get("question"),
-        "yes_price": prices[0] if prices else None,
-        "no_price": prices[1] if len(prices) > 1 else None,
-        "volume": m.get("volume"),
-        "volume_24h": m.get("volume24hr"),
-        "liquidity": m.get("liquidity"),
-        "end_date": m.get("endDate"),
-        "active": m.get("active"),
-        "closed": m.get("closed"),
+        "question": _required_text(market, "question"),
+        "slug": _required_text(market, "slug"),
+        "outcome_prices": _outcome_prices(market),
+        "volume_24h": market.get("volume24hr"),
+        "liquidity": market.get("liquidity"),
+        "end_date": market.get("endDate"),
+        "event": event_title,
+        "url": f"{POLYMARKET_EVENT_URL}/{quote(event_slug, safe='')}",
     }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+async def search_markets(
+    query: SearchQuery,
+    limit: SearchLimit = 20,
+    page: SearchPage = 1,
+) -> list[dict[str, object]]:
+    """Search active Polymarket events and return their markets.
 
-def _parse_prices(raw: str) -> list[float]:
-    try:
-        return [float(p) for p in json.loads(raw)]
-    except Exception:
+    ``page`` follows the Gamma search endpoint's one-based pagination. Use the
+    next page when the desired market is not present in a bounded result set.
+    """
+    query = query.strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    if page < 1:
+        raise ValueError("page must be at least 1")
+
+    payload = await _get_gamma(
+        "/public-search",
+        params={
+            "q": query,
+            "events_status": "active",
+            "limit_per_type": limit,
+            "page": page,
+            "search_profiles": False,
+            "search_tags": False,
+        },
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("Polymarket search response must be an object")
+
+    events = payload.get("events")
+    if events is None:
         return []
+    if not isinstance(events, list):
+        raise ValueError("Polymarket search response events must be a list")
+
+    results: list[dict[str, object]] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise ValueError("Polymarket search response contains an invalid event")
+        event_slug = _required_text(event, "slug")
+        markets = event.get("markets")
+        if not isinstance(markets, list):
+            raise ValueError("Polymarket event markets must be a list")
+        for market in markets:
+            if not isinstance(market, Mapping):
+                raise ValueError("Polymarket event contains an invalid market")
+            results.append(
+                _market_summary(
+                    market,
+                    event_title=event.get("title"),
+                    event_slug=event_slug,
+                )
+            )
+            if len(results) == limit:
+                return results
+    return results
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+async def get_market_by_slug(slug: MarketSlug) -> dict[str, object]:
+    """Fetch one market by its exact Gamma API slug."""
+    slug = slug.strip()
+    if not slug:
+        raise ValueError("slug must not be empty")
 
-app = create_app(
-    mcp=mcp,
-    # Remove StaticPasswordProvider to use SingleUserProvider (no login)
-    # provider=StaticPasswordProvider(os.environ["ADMIN_PASSWORD"]),
-    title="Polymarket MCP",
-)
+    payload = await _get_gamma(f"/markets/slug/{quote(slug, safe='')}")
+    if not isinstance(payload, Mapping):
+        raise ValueError("Polymarket market response must be an object")
 
-# ---------------------------------------------------------------------------
-# Dev entrypoint
-# ---------------------------------------------------------------------------
+    events = payload.get("events")
+    if not isinstance(events, list) or not events or not isinstance(events[0], Mapping):
+        raise ValueError("Polymarket market response is missing its parent event")
+    event = events[0]
+    event_slug = _required_text(event, "slug")
+
+    result = _market_summary(
+        payload,
+        event_title=event.get("title"),
+        event_slug=event_slug,
+    )
+    return {
+        **result,
+        "volume": payload.get("volume"),
+        "active": payload.get("active"),
+        "closed": payload.get("closed"),
+    }
+
+
+def _new_server(auth: AuthProvider | None) -> FastMCP:
+    server = FastMCP(
+        "polymarket",
+        instructions=(
+            "Search live Polymarket prediction markets and inspect a market by slug. "
+            "These tools are read-only and never place trades."
+        ),
+        auth=auth,
+    )
+    server.tool()(search_markets)
+    server.tool()(get_market_by_slug)
+    return server
+
+
+def build_app() -> Starlette:
+    """Build the ASGI application from the current authentication environment."""
+    auth = auth_from_env()
+    server = _new_server(auth)
+    return create_app(server, allow_anonymous=auth is None)
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+
+    uvicorn.run(build_app(), host="0.0.0.0", port=8080, log_level="info")

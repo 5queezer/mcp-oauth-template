@@ -1,518 +1,280 @@
-"""
-Tests for MCP OAuth template.
-Run: pytest tests/ -v
-"""
+"""Regressions for the native OAuth integration, including browser consent."""
 
-import base64
-import hashlib
-import secrets
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
+from fastmcp import FastMCP
 from starlette.testclient import TestClient
 
-from mcp_server.auth import (
-    SingleUserProvider,
-    StaticPasswordProvider,
-    TokenStore,
-    ClientStore,
-    verify_pkce,
+from mcp_server import GitHubAuthProvider, create_app, get_current_sub
+from tests.conftest import (
+    BASE_URL,
+    begin_authorization,
+    call_tool,
+    issue_code,
+    mint_token,
+    register,
 )
-from mcp_server.app import create_app
-from mcp_server.templates import render_login
 
 
-REDIRECT_URI = "https://claude.ai/callback"
+def test_discovery_describes_the_actual_resource(oauth_client):
+    denied = oauth_client.post("/mcp", json={})
+    assert denied.status_code == 401
+    assert "resource_metadata=" in denied.headers["www-authenticate"]
+    resource = oauth_client.get("/.well-known/oauth-protected-resource/mcp").json()
+    assert resource["resource"] == f"{BASE_URL}/mcp"
+    metadata = oauth_client.get("/.well-known/oauth-authorization-server").json()
+    assert metadata["issuer"] == f"{BASE_URL}/"
+    assert metadata["code_challenge_methods_supported"] == ["S256"]
+    assert "revocation_endpoint" not in metadata
+    assert oauth_client.post("/revoke").status_code == 404
 
 
-# ---------------------------------------------------------------------------
-# PKCE Unit Tests
-# ---------------------------------------------------------------------------
-
-def make_pkce_pair():
-    verifier = secrets.token_urlsafe(32)
-    digest = hashlib.sha256(verifier.encode()).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return verifier, challenge
+@pytest.mark.parametrize(
+    "payload", [None, [], 7, {"redirect_uris": []}, {"redirect_uris": "https://client.example/cb"}]
+)
+def test_malformed_registration_is_a_client_error(oauth_client, payload):
+    response = oauth_client.post("/register", json=payload)
+    assert response.status_code == 400
+    assert "error" in response.json()
 
 
-def test_pkce_valid():
-    verifier, challenge = make_pkce_pair()
-    assert verify_pkce(verifier, challenge)
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "http://evil.example/cb",
+        "https://",
+        "https://client.example/cb#fragment",
+        "https://user:secret@client.example/cb",
+        "javascript:alert(1)",
+    ],
+)
+def test_unsafe_registration_rejected(oauth_client, redirect):
+    response = oauth_client.post("/register", json={"redirect_uris": [redirect]})
+    assert response.status_code == 400
 
 
-def test_pkce_wrong_verifier():
-    _, challenge = make_pkce_pair()
-    assert not verify_pkce("wrong_verifier", challenge)
-
-
-def test_pkce_tampered_challenge():
-    verifier, _ = make_pkce_pair()
-    assert not verify_pkce(verifier, "tampered_challenge")
-
-
-# ---------------------------------------------------------------------------
-# TokenStore Unit Tests
-# ---------------------------------------------------------------------------
-
-def test_token_store_full_flow():
-    store = TokenStore()
-    verifier, challenge = make_pkce_pair()
-
-    code = store.create_code(
-        challenge=challenge,
-        redirect_uri=REDIRECT_URI,
-        state="xyz",
-        sub="test-user",
-    )
-
-    entry = store.consume_code(code)
-    assert entry is not None
-    assert entry.challenge == challenge
-
-    # Code should be consumed (single-use)
-    assert store.consume_code(code) is None
-
-
-def test_token_store_invalid_token():
-    store = TokenStore()
-    assert store.validate_token("nonexistent") is None
-
-
-def test_token_store_revoke():
-    store = TokenStore()
-    verifier, challenge = make_pkce_pair()
-    code = store.create_code(challenge, REDIRECT_URI, "", "test-user")
-    store.consume_code(code)  # consume so we can issue token
-
-    token = store.create_token("user")
-    assert store.validate_token(token) is not None
-
-    store.revoke_token(token)
-    assert store.validate_token(token) is None
-
-
-# ---------------------------------------------------------------------------
-# ClientStore Unit Tests
-# ---------------------------------------------------------------------------
-
-def test_client_store_register_and_get():
-    cs = ClientStore()
-    client = cs.register(redirect_uris=[REDIRECT_URI], client_name="test")
-    assert client.client_id
-    assert client.redirect_uris == [REDIRECT_URI]
-
-    fetched = cs.get(client.client_id)
-    assert fetched is not None
-    assert fetched.client_id == client.client_id
-
-
-def test_client_store_unknown_id():
-    cs = ClientStore()
-    assert cs.get("nonexistent") is None
-
-
-# ---------------------------------------------------------------------------
-# Integration Tests (Full OAuth Flow)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def client():
-    app = create_app(title="Test MCP")
-    return TestClient(app, raise_server_exceptions=True)
-
-
-def _register_client(client) -> str:
-    """Register a client and return its client_id."""
-    resp = client.post(
-        "/register",
-        json={"redirect_uris": [REDIRECT_URI], "client_name": "test-client"},
-    )
-    assert resp.status_code == 201
-    return resp.json()["client_id"]
-
-
-def test_health(client):
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
-
-
-def test_oauth_metadata(client):
-    resp = client.get("/.well-known/oauth-authorization-server")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "authorization_endpoint" in data
-    assert "token_endpoint" in data
-    assert "registration_endpoint" in data
-    assert "S256" in data["code_challenge_methods_supported"]
-
-
-def test_protected_resource_metadata(client):
-    resp = client.get("/.well-known/oauth-protected-resource")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "resource" in data
-    assert "authorization_servers" in data
-    assert len(data["authorization_servers"]) == 1
-
-
-def test_register_client(client):
-    resp = client.post(
-        "/register",
-        json={"redirect_uris": [REDIRECT_URI], "client_name": "my-app"},
-    )
-    assert resp.status_code == 201
-    data = resp.json()
-    assert "client_id" in data
-    assert data["redirect_uris"] == [REDIRECT_URI]
-    assert data["token_endpoint_auth_method"] == "none"
-
-
-def test_register_missing_redirect_uris(client):
-    resp = client.post("/register", json={"client_name": "no-uris"})
-    assert resp.status_code == 400
-    assert resp.json()["error"] == "invalid_client_metadata"
-
-
-def test_authorize_unknown_client(client):
-    verifier, challenge = make_pkce_pair()
-    resp = client.get(
+@pytest.mark.parametrize("client_id", ["", "unknown", "github-app-id"])
+def test_missing_or_unregistered_client_never_receives_code(oauth_client, client_id):
+    response = oauth_client.get(
         "/authorize",
         params={
-            "response_type": "code",
-            "client_id": "unknown-client-id",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "s",
-        },
-        follow_redirects=False,
-    )
-    assert resp.status_code == 400
-    assert resp.json()["error"] == "invalid_client"
-
-
-def test_authorize_unregistered_redirect_uri(client):
-    client_id = _register_client(client)
-    verifier, challenge = make_pkce_pair()
-    resp = client.get(
-        "/authorize",
-        params={
-            "response_type": "code",
             "client_id": client_id,
-            "code_challenge": challenge,
+            "redirect_uri": "https://attacker.invalid/cb",
+            "response_type": "code",
+            "code_challenge": "a" * 43,
             "code_challenge_method": "S256",
-            "redirect_uri": "https://attacker.example.com/callback",
-            "state": "s",
         },
         follow_redirects=False,
     )
-    assert resp.status_code == 400
-    assert resp.json()["error"] == "invalid_request"
+    assert response.status_code == 400
+    assert "location" not in response.headers
 
 
-def _full_pkce_flow(client, password: str | None = None) -> str:
-    """Helper: runs full PKCE flow (with registration), returns access token.
-
-    If `password` is given, performs the POST-login step expected when a
-    StaticPasswordProvider is active.
-    """
-    client_id = _register_client(client)
-    verifier, challenge = make_pkce_pair()
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "redirect_uri": REDIRECT_URI,
-        "state": "test123",
-    }
-
-    # Step 1: /authorize (GET)
-    resp = client.get("/authorize", params=params, follow_redirects=False)
-
-    if password is not None:
-        # Password provider: GET returns login page, POST with password redirects.
-        assert resp.status_code == 200
-        assert "text/html" in resp.headers["content-type"]
-        resp = client.post(
-            "/authorize",
-            params=params,
-            data={"password": password},
-            follow_redirects=False,
-        )
-
-    assert resp.status_code == 302
-    location = resp.headers["location"]
-    assert "code=" in location
-    assert "state=test123" in location
-
-    code = location.split("code=")[1].split("&")[0]
-
-    # Step 2: /token
-    resp = client.post(
-        "/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": REDIRECT_URI,
-        },
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "access_token" in data
-    assert data["token_type"] == "bearer"
-    return data["access_token"]
-
-
-def test_full_oauth_flow(client):
-    token = _full_pkce_flow(client)
-    assert len(token) > 10
-
-
-def test_mcp_requires_bearer(client):
-    resp = client.post("/mcp", json={})
-    assert resp.status_code == 401
-    www_auth = resp.headers.get("www-authenticate", "")
-    assert "resource_metadata" in www_auth
-
-
-def test_mcp_with_expired_token(client):
-    """Expired/revoked tokens must be rejected with 401."""
-    token = _full_pkce_flow(client)
-    # Revoke the token first
-    client.post("/revoke", data=f"token={token}")
-    resp = client.post(
-        "/mcp",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
-    )
-    assert resp.status_code == 401
-
-
-def test_code_single_use(client):
-    """Auth codes must be consumed exactly once."""
-    client_id = _register_client(client)
-    verifier, challenge = make_pkce_pair()
-    resp = client.get(
+def test_callback_must_match_registered_client(oauth_client):
+    client_id = register(oauth_client)
+    response = oauth_client.get(
         "/authorize",
         params={
-            "response_type": "code",
             "client_id": client_id,
+            "redirect_uri": "https://other.example/cb",
+            "response_type": "code",
+            "code_challenge": "a" * 43,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "location" not in response.headers
+
+
+def test_consent_is_required_again_for_same_client(oauth_client):
+    client_id, _, _, page = begin_authorization(oauth_client)
+    assert "Test client" in page.text
+    assert "client.example" in page.text
+    _, _, _, second_page = begin_authorization(oauth_client, client_id=client_id)
+    assert second_page.status_code == 200
+    assert "csrf_token" in second_page.text
+
+
+def test_consent_post_requires_the_approving_browser(oauth_client, github_http):
+    _, _, fields, _ = begin_authorization(oauth_client)
+    oauth_client.cookies.clear()
+    response = oauth_client.post(
+        "/consent", data={**fields, "action": "approve"}, follow_redirects=False
+    )
+    assert response.status_code in {400, 403}
+    assert not github_http.calls
+
+
+def test_upstream_callback_requires_browser_binding(oauth_client, github_http):
+    _, _, fields, _ = begin_authorization(oauth_client)
+    response = oauth_client.post(
+        "/consent", data={**fields, "action": "approve"}, follow_redirects=False
+    )
+    state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
+    oauth_client.cookies.clear()
+    response = oauth_client.get("/auth/callback", params={"state": state, "code": "101"})
+    assert response.status_code == 403
+    assert not github_http.calls
+
+
+@pytest.mark.parametrize("state", ["a+b", "a&other=1", "a#b", "a%26b"])
+def test_complete_pkce_flow_preserves_opaque_state(oauth_client, state):
+    response = oauth_client.post("/token", data=issue_code(oauth_client, state=state))
+    assert response.status_code == 200, response.text
+    assert response.json()["expires_in"] <= 3600
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert not response.json()["access_token"].startswith("upstream-")
+
+
+def test_code_cannot_be_redeemed_by_another_client(oauth_client):
+    form = issue_code(oauth_client)
+    form["client_id"] = register(oauth_client)
+    response = oauth_client.post("/token", data=form)
+    assert response.status_code in {400, 401}
+    assert "access_token" not in response.json()
+
+
+def test_code_is_single_use(oauth_client):
+    form = issue_code(oauth_client)
+    assert oauth_client.post("/token", data=form).status_code == 200
+    assert oauth_client.post("/token", data=form).status_code in {400, 401}
+
+
+@pytest.mark.parametrize("verifier", ["wrong", "é" * 43])
+def test_invalid_verifier_returns_client_error(oauth_client, verifier):
+    form = issue_code(oauth_client)
+    form["code_verifier"] = verifier
+    response = oauth_client.post("/token", data=form)
+    assert response.status_code in {400, 401}
+
+
+def test_each_bearer_uses_its_own_github_identity(oauth_client):
+    alice = mint_token(oauth_client, user="101")
+    bob = mint_token(oauth_client, user="202")
+    for token, subject in [(alice, "101"), (bob, "202"), (alice, "101")]:
+        response = call_tool(oauth_client, token)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"]["content"][0]["text"] == subject
+        assert "upstream-" not in response.text
+
+
+def test_allowlist_is_enforced_on_already_issued_token(oauth_client, github_provider):
+    token = mint_token(oauth_client, user="101")
+    github_provider.allowed_user_ids = frozenset({"202"})
+    assert call_tool(oauth_client, token).status_code == 401
+
+
+def test_disallowed_github_account_cannot_call_tools(oauth_client):
+    token = mint_token(oauth_client, user="303")
+    assert call_tool(oauth_client, token).status_code == 401
+
+
+def test_revoking_upstream_authorization_invalidates_mcp_access(oauth_client, github_http):
+    token = mint_token(oauth_client)
+    assert call_tool(oauth_client, token).status_code == 200
+    github_http.revoked.add("upstream-101")
+    assert call_tool(oauth_client, token).status_code == 401
+
+
+def test_github_tokens_are_encrypted_at_rest(oauth_client, tmp_path):
+    mint_token(oauth_client)
+    files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert files
+    assert all(b"upstream-101" not in p.read_bytes() for p in files)
+
+
+def test_wrong_resource_never_receives_authorization_code(oauth_client):
+    response = oauth_client.get(
+        "/authorize",
+        params={
+            "client_id": register(oauth_client),
+            "redirect_uri": "https://client.example/callback",
+            "response_type": "code",
+            "code_challenge": "a" * 43,
+            "code_challenge_method": "S256",
+            "resource": "https://different-server.example/mcp",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code in {302, 400}
+    if response.status_code == 302:
+        query = parse_qs(urlsplit(response.headers["location"]).query)
+        assert query["error"] == ["invalid_target"]
+        assert "code" not in query
+
+
+def test_callback_state_cannot_be_replayed(oauth_client):
+    _, _, fields, _ = begin_authorization(oauth_client)
+    consent = oauth_client.post(
+        "/consent", data={**fields, "action": "approve"}, follow_redirects=False
+    )
+    state = parse_qs(urlsplit(consent.headers["location"]).query)["state"][0]
+    params = {"state": state, "code": "101"}
+    assert (
+        oauth_client.get("/auth/callback", params=params, follow_redirects=False).status_code == 302
+    )
+    assert (
+        oauth_client.get("/auth/callback", params=params, follow_redirects=False).status_code == 400
+    )
+
+
+def test_encrypted_storage_survives_app_recreation(oauth_client):
+    token = mint_token(oauth_client)
+    provider = GitHubAuthProvider(
+        client_id="github-app-id",
+        client_secret="test-github-app-secret",
+        base_url=BASE_URL,
+        allowed_user_ids={"101"},
+    )
+    server = FastMCP("restarted", auth=provider)
+
+    @server.tool()
+    def identity() -> str | None:
+        return get_current_sub()
+
+    with TestClient(create_app(server), base_url=BASE_URL) as restarted:
+        response = call_tool(restarted, token)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"]["content"][0]["text"] == "101"
+
+
+def test_expired_native_access_token_is_denied(oauth_client, github_provider):
+    token = mint_token(oauth_client)
+    claims = github_provider.jwt_issuer.verify_token(token)
+    expired = github_provider.jwt_issuer.issue_access_token(
+        client_id=claims["client_id"], scopes=["read:user"], jti=claims["jti"], expires_in=-120
+    )
+    assert call_tool(oauth_client, expired).status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("challenge", "method"),
+    [
+        ("", "S256"),
+        ("a" * 42, "S256"),
+        ("a" * 44, "S256"),
+        ("+" * 43, "S256"),
+        ("é" * 43, "S256"),
+        ("a" * 43, "plain"),
+    ],
+)
+def test_authorize_rejects_invalid_pkce_challenge(oauth_client, challenge, method):
+    response = oauth_client.get(
+        "/authorize",
+        params={
+            "client_id": register(oauth_client),
+            "redirect_uri": "https://client.example/callback",
+            "response_type": "code",
             "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "",
+            "code_challenge_method": method,
         },
         follow_redirects=False,
     )
-    code = resp.headers["location"].split("code=")[1].split("&")[0]
-
-    # First exchange: success
-    r1 = client.post("/token", data={
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": verifier,
-    })
-    assert r1.status_code == 200
-
-    # Second exchange: fail
-    r2 = client.post("/token", data={
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": verifier,
-    })
-    assert r2.status_code == 400
-    assert r2.json()["error"] == "invalid_grant"
-
-
-def test_wrong_verifier_rejected(client):
-    client_id = _register_client(client)
-    _, challenge = make_pkce_pair()
-    resp = client.get(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "",
-        },
-        follow_redirects=False,
-    )
-    code = resp.headers["location"].split("code=")[1].split("&")[0]
-
-    r = client.post("/token", data={
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": "wrong_verifier_that_will_fail",
-    })
-    assert r.status_code == 400
-    assert r.json()["error"] == "invalid_grant"
-
-
-def test_token_rfc6749_error_format(client):
-    """Token endpoint errors must use RFC 6749 format, not FastAPI detail."""
-    r = client.post("/token", data={
-        "grant_type": "client_credentials",  # unsupported
-        "code": "x",
-        "code_verifier": "x",
-    })
-    assert r.status_code == 400
-    body = r.json()
-    assert "error" in body
-    assert "detail" not in body
-
-
-# ---------------------------------------------------------------------------
-# Password login page (StaticPasswordProvider)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def pw_client():
-    app = create_app(
-        title="Test MCP",
-        provider=StaticPasswordProvider("s3cr3t"),
-    )
-    return TestClient(app, raise_server_exceptions=True)
-
-
-def _pw_register(pw_client) -> str:
-    resp = pw_client.post(
-        "/register",
-        json={"redirect_uris": [REDIRECT_URI], "client_name": "pw-client"},
-    )
-    assert resp.status_code == 201
-    return resp.json()["client_id"]
-
-
-def test_password_get_renders_login_form(pw_client):
-    client_id = _pw_register(pw_client)
-    _, challenge = make_pkce_pair()
-    resp = pw_client.get(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "xyz",
-        },
-        follow_redirects=False,
-    )
-    assert resp.status_code == 200
-    assert "text/html" in resp.headers["content-type"]
-    body = resp.text
-    assert 'action="/authorize"' in body
-    assert 'method="post"' in body
-    assert 'name="code_challenge"' in body
-    assert f'value="{challenge}"' in body
-    assert 'type="password"' in body
-
-
-def test_password_post_correct_redirects(pw_client):
-    client_id = _pw_register(pw_client)
-    _, challenge = make_pkce_pair()
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "redirect_uri": REDIRECT_URI,
-        "state": "s1",
-    }
-    resp = pw_client.post(
-        "/authorize",
-        params=params,
-        data={"password": "s3cr3t"},
-        follow_redirects=False,
-    )
-    assert resp.status_code == 302
-    loc = resp.headers["location"]
-    assert loc.startswith(REDIRECT_URI)
-    assert "code=" in loc
-    assert "state=s1" in loc
-
-
-def test_password_post_wrong_shows_error(pw_client):
-    client_id = _pw_register(pw_client)
-    _, challenge = make_pkce_pair()
-    resp = pw_client.post(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "s1",
-        },
-        data={"password": "wrong"},
-        follow_redirects=False,
-    )
-    assert resp.status_code == 200
-    assert "Invalid password" in resp.text
-    assert 'type="password"' in resp.text
-
-
-def test_password_post_missing_code_challenge_400(pw_client):
-    client_id = _pw_register(pw_client)
-    resp = pw_client.post(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "s",
-        },
-        data={"password": "s3cr3t"},
-        follow_redirects=False,
-    )
-    assert resp.status_code == 400
-    assert resp.json()["error"] == "invalid_request"
-
-
-def test_single_user_get_still_redirects(client):
-    """SingleUserProvider (default) must not render HTML — short-circuits to 302."""
-    client_id = _register_client(client)
-    _, challenge = make_pkce_pair()
-    resp = client.get(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": "s",
-        },
-        follow_redirects=False,
-    )
-    assert resp.status_code == 302
-    assert "text/html" not in resp.headers.get("content-type", "")
-
-
-def test_login_page_escapes_hostile_state():
-    """Injected state must not produce raw <script> in the rendered form."""
-    evil = '"><script>alert(1)</script>'
-    html = render_login(
-        title="Test",
-        params={
-            "response_type": "code",
-            "code_challenge": "abc",
-            "code_challenge_method": "S256",
-            "redirect_uri": REDIRECT_URI,
-            "state": evil,
-        },
-    )
-    assert "<script>alert(1)</script>" not in html
-    assert "&lt;script&gt;" in html or "&quot;&gt;&lt;script&gt;" in html
-
-
-def test_full_oauth_flow_with_password(pw_client):
-    """End-to-end: GET shows form → POST password → /token → access token."""
-    token = _full_pkce_flow(pw_client, password="s3cr3t")
-    assert len(token) > 10
+    assert response.status_code in {302, 400}, response.text
+    if response.status_code == 302:
+        query = parse_qs(urlsplit(response.headers["location"]).query)
+        assert "error" in query
+        assert "code" not in query

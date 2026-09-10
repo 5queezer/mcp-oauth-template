@@ -1,222 +1,141 @@
-"""
-OAuth 2.1 PKCE Auth Layer for MCP Servers.
+"""GitHub authorization policy on top of FastMCP's maintained OAuth provider."""
 
-Single-user mode: /authorize issues code directly (no login form).
-Multi-user mode: subclass AuthProvider and override authenticate().
-"""
+import os
+import re
+from collections.abc import Collection
+from urllib.parse import urlsplit
 
-import hashlib
-import base64
-import secrets
-import time
-import logging
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional
-from urllib.parse import urlparse
-
-from starlette.requests import Request
-from starlette.responses import Response
-
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Data Models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AuthCode:
-    challenge: str          # S256 code_challenge from client
-    redirect_uri: str
-    state: str
-    sub: str                # authenticated subject, carried forward to token
-    expires: float = field(default_factory=lambda: time.time() + 300)
+from fastmcp.server.auth.providers.github import GitHubProvider
+from key_value.aio.protocols import AsyncKeyValue
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationParams,
+    AuthorizeError,
+    RegistrationError,
+)
+from mcp.shared.auth import OAuthClientInformationFull
 
 
-@dataclass
-class AccessToken:
-    sub: str                # user/service identifier
-    expires: float = field(default_factory=lambda: time.time() + 3600)
-
-
-# ---------------------------------------------------------------------------
-# PKCE Helpers
-# ---------------------------------------------------------------------------
-
-def verify_pkce(verifier: str, challenge: str) -> bool:
-    """SHA-256 PKCE verification (RFC 7636 §4.6)."""
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return secrets.compare_digest(computed, challenge)
-
-
-# ---------------------------------------------------------------------------
-# Auth Provider (swap this for multi-user)
-# ---------------------------------------------------------------------------
-
-class AuthProvider(ABC):
-    """
-    Override this to plug in your identity logic.
-    Single-user default: always grants access.
-    Multi-user: validate credentials, return subject string or None.
-    """
-
-    @abstractmethod
-    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
-        """
-        Return subject (user id / name) or None if auth fails.
-
-        Args:
-            request:     The underlying Starlette Request. Advanced providers
-                         may read headers, cookies, or upstream session state
-                         from this to make auth decisions.
-            credentials: Merged dict of /authorize query params plus any POST
-                         form fields (e.g. "password"). Simple providers can
-                         look at this alone.
-
-        Example (upstream OAuth / session cookie):
-            def authenticate(self, request, credentials):
-                sess = request.cookies.get("session")
-                return self._resolve_session(sess)
-        """
-        ...
-
-    def challenge(self, request: Request, credentials: dict[str, str]) -> Optional[Response]:
-        """
-        Optional hook: produce a non-password challenge Response when
-        `authenticate` returned None on an initial GET /authorize.
-
-        Return a Response (typically a RedirectResponse to an upstream IdP)
-        to start an external login flow. Return None to let the caller fall
-        back to the built-in password login form.
-
-        Only invoked when the provider said "no session" and the request
-        is the initial GET with no submitted credentials — POST failures
-        keep showing the password form with an error.
-        """
-        return None
-
-
-class SingleUserProvider(AuthProvider):
-    """
-    No login UI. /authorize immediately issues a code.
-    Safe when your Cloud Run service is not publicly guessable
-    or you protect /authorize with VPN / IP allowlist.
-    """
-    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
-        return "local-user"
-
-
-class StaticPasswordProvider(AuthProvider):
-    """
-    Password-gated single-user mode. On GET /authorize the server renders a
-    password form; the submitted password is passed in `credentials`.
-    Good for single-user deployments that want minimal friction.
-    """
-    def __init__(self, password: str):
-        self._password = password
-
-    def authenticate(self, request: Request, credentials: dict[str, str]) -> Optional[str]:
-        provided = credentials.get("password", "")
-        if secrets.compare_digest(provided, self._password):
-            return "admin"
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Token Store (swap for Redis/SQLite in production)
-# ---------------------------------------------------------------------------
-
-class TokenStore:
-    def __init__(self):
-        self._codes: dict[str, AuthCode] = {}
-        self._tokens: dict[str, AccessToken] = {}
-
-    # -- Auth codes --
-
-    def create_code(self, challenge: str, redirect_uri: str, state: str, sub: str) -> str:
-        code = secrets.token_urlsafe(32)
-        self._codes[code] = AuthCode(
-            challenge=challenge,
-            redirect_uri=redirect_uri,
-            state=state,
-            sub=sub,
-        )
-        self._gc_codes()
-        return code
-
-    def consume_code(self, code: str) -> Optional[AuthCode]:
-        entry = self._codes.pop(code, None)
-        if entry and time.time() < entry.expires:
-            return entry
-        return None
-
-    # -- Access tokens --
-
-    def create_token(self, sub: str) -> str:
-        token = secrets.token_urlsafe(48)
-        self._tokens[token] = AccessToken(sub=sub)
-        return token
-
-    def validate_token(self, token: str) -> Optional[AccessToken]:
-        entry = self._tokens.get(token)
-        if entry and time.time() < entry.expires:
-            return entry
-        if entry:
-            del self._tokens[token]  # expired -- clean up
-        return None
-
-    def revoke_token(self, token: str) -> None:
-        self._tokens.pop(token, None)
-
-    # -- GC --
-
-    def _gc_codes(self):
-        now = time.time()
-        expired = [k for k, v in self._codes.items() if now > v.expires]
-        for k in expired:
-            del self._codes[k]
-
-
-# ---------------------------------------------------------------------------
-# Client Store (RFC 7591 dynamic registration)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OAuthClient:
-    client_id: str
-    redirect_uris: list[str]
-    client_name: str = ""
-    issued_at: float = field(default_factory=time.time)
-
-
-def _validate_redirect_uri(uri: str) -> bool:
-    """Allow https everywhere; allow http only for localhost/loopback (dev)."""
+def _safe_http_url(url: str) -> bool:
     try:
-        parsed = urlparse(uri)
-    except Exception:
-        return False
-    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
-        return parsed.scheme in ("http", "https")
-    return parsed.scheme == "https"
-
-
-class ClientStore:
-    def __init__(self):
-        self._clients: dict[str, OAuthClient] = {}
-
-    def register(self, redirect_uris: list[str], client_name: str = "") -> OAuthClient:
-        for uri in redirect_uris:
-            if not _validate_redirect_uri(uri):
-                raise ValueError(f"Invalid redirect_uri: {uri!r} — must be https (or http for localhost)")
-        client_id = secrets.token_urlsafe(16)
-        client = OAuthClient(
-            client_id=client_id,
-            redirect_uris=redirect_uris,
-            client_name=client_name,
+        parsed = urlsplit(url)
+        _ = parsed.port
+        return bool(
+            parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+            and "#" not in url
+            and (
+                parsed.scheme == "https"
+                or (
+                    parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                )
+            )
         )
-        self._clients[client_id] = client
-        return client
+    except ValueError:
+        return False
 
-    def get(self, client_id: str) -> Optional[OAuthClient]:
-        return self._clients.get(client_id)
+
+class GitHubAuthProvider(GitHubProvider):
+    """Require an allowed immutable GitHub user ID on every bearer request.
+
+    Native OAuth handles consent, PKCE, client binding and encrypted local
+    storage. An injected ``encrypted_storage`` must already encrypt its values;
+    FastMCP does not wrap custom backends. Environment changes require restart.
+    """
+
+    def __init__(
+        self,
+        *,
+        allowed_user_ids: Collection[str],
+        client_id: str,
+        client_secret: str,
+        base_url: str,
+        encrypted_storage: AsyncKeyValue | None = None,
+    ) -> None:
+        ids = frozenset(allowed_user_ids)
+        if not ids or any(not re.fullmatch(r"[1-9][0-9]*", uid) for uid in ids):
+            raise ValueError("At least one positive numeric GitHub user ID is required")
+        if (
+            not _safe_http_url(base_url)
+            or urlsplit(base_url).path not in {"", "/"}
+            or "?" in base_url
+        ):
+            raise ValueError(
+                "BASE_URL must be an HTTPS origin (or loopback HTTP), without a path, query or fragment"
+            )
+        if not client_id.strip() or not client_secret.strip():
+            raise ValueError("GitHub client ID and secret are required")
+        self.allowed_user_ids = ids
+        self.github_client_id = client_id
+        super().__init__(
+            client_id=client_id,
+            client_secret=client_secret,
+            base_url=base_url.rstrip("/"),
+            required_scopes=["read:user"],
+            require_authorization_consent=True,
+            cache_ttl_seconds=None,
+            fastmcp_access_token_expiry_seconds=3600,
+            client_storage=encrypted_storage,
+            forward_resource=False,
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        access = await super().load_access_token(token)
+        return access if access and access.subject in self.allowed_user_ids else None
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        # Disable the upstream-app-ID compatibility shortcut: downstream clients
+        # must register or provide a verified Client ID Metadata Document.
+        if client_id == self.github_client_id:
+            return None
+        return await super().get_client(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if not client_info.redirect_uris or any(
+            not _safe_http_url(str(uri)) for uri in client_info.redirect_uris
+        ):
+            raise RegistrationError(
+                "invalid_redirect_uri",
+                "Register an HTTPS or loopback HTTP callback without credentials or fragments",
+            )
+        await super().register_client(client_info)
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        if not _safe_http_url(str(params.redirect_uri)):
+            raise AuthorizeError("invalid_request", "Invalid redirect URI")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", params.code_challenge or ""):
+            raise AuthorizeError("invalid_request", "A valid S256 PKCE challenge is required")
+        return await super().authorize(client, params)
+
+
+def auth_from_env() -> GitHubAuthProvider | None:
+    """Load GitHub auth by default; only MCP_AUTH_MODE=demo permits anonymous access."""
+    if "ADMIN_PASSWORD" in os.environ:
+        raise ValueError(
+            "ADMIN_PASSWORD is no longer supported; configure GitHub OAuth and remove the legacy variable"
+        )
+    mode = os.getenv("MCP_AUTH_MODE", "github")
+    if mode == "demo":
+        return None
+    if mode != "github":
+        raise ValueError("MCP_AUTH_MODE must be github or demo")
+
+    def required(name: str) -> str:
+        value = os.getenv(name, "").strip()
+        if not value:
+            raise ValueError(f"{name} is required for GitHub OAuth")
+        return value
+
+    base_url = required("BASE_URL")
+    client_id = required("GITHUB_CLIENT_ID")
+    client_secret = required("GITHUB_CLIENT_SECRET")
+    ids = required("GITHUB_ALLOWED_USER_IDS").split(",")
+    return GitHubAuthProvider(
+        allowed_user_ids={uid.strip() for uid in ids},
+        client_id=client_id,
+        client_secret=client_secret,
+        base_url=base_url,
+    )
