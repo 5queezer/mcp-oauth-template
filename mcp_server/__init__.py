@@ -1,22 +1,7 @@
-from .app import create_app
-from .auth import (
-    AuthProvider,
-    ClientStore,
-    OAuthClient,
-    SingleUserProvider,
-    StaticPasswordProvider,
-    TokenStore,
-)
-from .context import current_sub, get_current_sub
+"""Public helpers for the MCP OAuth template."""
 
-__all__ = [
-    "create_app",
-    "AuthProvider",
-    "ClientStore",
-    "OAuthClient",
-    "SingleUserProvider",
-    "StaticPasswordProvider",
-    "TokenStore",
-    "current_sub",
-    "get_current_sub",
-]
+from .app import create_app
+from .auth import GitHubAuthProvider, auth_from_env
+from .context import get_current_sub
+
+__all__ = ["GitHubAuthProvider", "auth_from_env", "create_app", "get_current_sub"]
