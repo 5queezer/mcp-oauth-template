@@ -16,48 +16,69 @@ def fake_gcloud(tmp_path: Path) -> tuple[dict[str, str], Path]:
     log = tmp_path / "gcloud.log"
     deployed = tmp_path / "deployed"
     executable.write_text(
-        """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$*" >> "$GCLOUD_LOG"
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
 
-if [[ "$*" == "config get-value project" ]]; then
-  printf '%s\\n' "configured-project"
-  exit 0
-fi
-
-if [[ "$*" == run\\ services\\ describe* ]]; then
-  if [[ "${GCLOUD_DESCRIBE_FAILS:-0}" == "1" ]]; then
-    echo "ERROR: (gcloud.run.services.describe) PERMISSION_DENIED: caller lacks permission" >&2
-    exit 1
-  fi
-  if [[ "${GCLOUD_SERVICE_EXISTS:-0}" == "1" || -f "$GCLOUD_DEPLOYED" ]]; then
-    if [[ "$*" == *MCP_AUTH_MODE* ]]; then
-      printf '%s\\n' "${GCLOUD_DEPLOYED_AUTH_MODE:-}"
-    else
-      printf '%s\\n' "https://canonical-service-uc.a.run.app"
-    fi
-    exit 0
-  fi
-  echo "ERROR: (gcloud.run.services.describe) Cannot find service [unknown]." >&2
-  exit 1
-fi
-
-if [[ "$*" == run\\ deploy* ]]; then
-  if [[ "${GCLOUD_SERVICE_EXISTS:-0}" != "1" && ! -f "$GCLOUD_DEPLOYED" && "$*" == *"--no-traffic"* ]]; then
-    echo "--no-traffic not supported when creating a new service." >&2
-    exit 1
-  fi
-  : > "$GCLOUD_DEPLOYED"
-fi
+args = sys.argv[1:]
+with Path(os.environ["GCLOUD_LOG"]).open("a") as log:
+    log.write(" ".join(args) + "\\n")
+deployed = Path(os.environ["GCLOUD_DEPLOYED"])
+exists = os.getenv("GCLOUD_SERVICE_EXISTS") == "1" or deployed.exists()
+if args == ["config", "get-value", "project"]:
+    print("configured-project")
+elif args[:3] == ["run", "services", "describe"]:
+    error = os.getenv("GCLOUD_DESCRIBE_ERROR") or ("PERMISSION_DENIED: caller lacks permission" if os.getenv("GCLOUD_DESCRIBE_FAILS") == "1" else None)
+    if error:
+        print("ERROR: (gcloud.run.services.describe) " + error, file=sys.stderr)
+        sys.exit(7 if os.getenv("GCLOUD_DESCRIBE_ERROR") else 1)
+    if not exists:
+        print(f"ERROR: (gcloud.run.services.describe) Cannot find service [{args[3]}]", file=sys.stderr)
+        sys.exit(1)
+    url = os.getenv("GCLOUD_SERVICE_URL", "https://canonical-service-uc.a.run.app")
+    if args[-1].startswith("value(") and "MCP_AUTH_MODE" in args[-1]:
+        mode = os.getenv("GCLOUD_AUTH_MODE", os.getenv("GCLOUD_DEPLOYED_AUTH_MODE", ""))
+        print("" if mode == "__missing__" else mode)
+    elif args[-1] == "value(status.url)":
+        print(url)
+    else:
+        mode = os.getenv("GCLOUD_AUTH_MODE", os.getenv("GCLOUD_DEPLOYED_AUTH_MODE", "github")) or "__missing__"
+        env = [] if mode == "__missing__" else [{"name": "MCP_AUTH_MODE", "value": mode}]
+        print(json.dumps({"status": {"url": url}, "spec": {"template": {"spec": {"containers": [{"env": env}]}}}}))
+elif args[:3] == ["run", "services", "get-iam-policy"]:
+    if os.getenv("GCLOUD_IAM_GET_ERROR"):
+        print("Cannot read IAM policy", file=sys.stderr)
+        sys.exit(8)
+    bindings = [{"role": "roles/run.invoker", "members": ["allUsers"]}] if os.getenv("GCLOUD_PUBLIC_IAM") == "1" else []
+    print(json.dumps({"bindings": bindings}))
+elif args[:3] in (["run", "services", "remove-iam-policy-binding"], ["run", "services", "add-iam-policy-binding"]):
+    if os.getenv("GCLOUD_IAM_WRITE_ERROR"):
+        print("Cannot update IAM policy", file=sys.stderr)
+        sys.exit(9)
+elif args[:2] == ["run", "deploy"]:
+    if not exists and "--no-traffic" in args:
+        print("--no-traffic not supported when creating a new service.", file=sys.stderr)
+        sys.exit(1)
+    deployed.touch()
 """
     )
     executable.chmod(0o755)
-    environment = {
+    environment: dict[str, str] = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "GCLOUD_LOG": str(log),
         "GCLOUD_DEPLOYED": str(deployed),
     }
+    for name in (
+        "MCP_AUTH_MODE",
+        "MCP_APP",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET_REF",
+        "GITHUB_ALLOWED_USER_IDS",
+    ):
+        environment.pop(name, None)
     return environment, log
 
 
@@ -93,7 +114,7 @@ def test_existing_service_preserves_configuration_and_selects_application(
     assert "--region europe-west1" in deploy
     assert "--source ." in deploy
     assert "--max-instances 1" in deploy
-    assert "--allow-unauthenticated" in deploy
+    assert "--allow-unauthenticated" not in deploy
     assert "--update-env-vars" in deploy
     assert "BASE_URL=https://canonical-service-uc.a.run.app" in deploy
     assert "MCP_APP=examples.polymarket_server:build_app" in deploy
@@ -241,3 +262,128 @@ def test_lookup_failure_does_not_bootstrap_over_an_existing_service(
     assert result.returncode == 1
     assert "Refusing to deploy" in result.stderr
     assert not any(command.startswith("run deploy ") for command in log.read_text().splitlines())
+
+
+@pytest.mark.parametrize("remote_mode", ["github", "demo", "__missing__"])
+def test_existing_service_uses_deployed_mode_for_iam(fake_gcloud, remote_mode):
+    environment, log = fake_gcloud
+    environment.update(
+        {
+            "GCLOUD_SERVICE_EXISTS": "1",
+            "GCLOUD_AUTH_MODE": remote_mode,
+            "MCP_AUTH_MODE": "github" if remote_mode == "demo" else "demo",
+        }
+    )
+    result = _run_deploy(environment, "existing-mcp", "europe-west1")
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text().splitlines()
+    deploy = next(command for command in commands if command.startswith("run deploy "))
+    if remote_mode == "demo":
+        assert "--no-allow-unauthenticated" in deploy
+        assert "--allow-unauthenticated" not in deploy
+        assert "--invoker-iam-check" in deploy
+        assert not any("--member allUsers" in command for command in commands)
+    else:
+        assert "--allow-unauthenticated" not in deploy
+        assert "add-iam-policy-binding" in commands[-1]
+        assert "--member allUsers" in commands[-1]
+    assert "MCP_AUTH_MODE=" not in deploy
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "PERMISSION_DENIED: missing run.services.get",
+        "UNAVAILABLE: service temporarily unavailable",
+        "NOT_FOUND: Project [missing-project] could not be found.",
+    ],
+)
+def test_describe_failure_never_bootstraps_a_service(fake_gcloud, error):
+    environment, log = fake_gcloud
+    environment.update(
+        {
+            "GCLOUD_SERVICE_EXISTS": "1",
+            "GCLOUD_DESCRIBE_ERROR": error,
+            "GITHUB_CLIENT_ID": "client-id",
+            "GITHUB_CLIENT_SECRET_REF": "secret:latest",
+            "GITHUB_ALLOWED_USER_IDS": "101",
+        }
+    )
+    result = _run_deploy(environment, "existing-mcp", "europe-west1")
+    assert result.returncode == 7
+    assert error in result.stderr
+    assert all(
+        command.startswith(("run services describe ", "config get-value "))
+        for command in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,url",
+    [
+        ("unknown", "https://canonical-service-uc.a.run.app"),
+        ("github", ""),
+    ],
+)
+def test_unreadable_deployed_config_fails_before_mutation(fake_gcloud, mode, url):
+    environment, log = fake_gcloud
+    environment.update(
+        {"GCLOUD_SERVICE_EXISTS": "1", "GCLOUD_AUTH_MODE": mode, "GCLOUD_SERVICE_URL": url}
+    )
+    result = _run_deploy(environment, "existing-mcp", "europe-west1")
+    assert result.returncode != 0
+    assert all(
+        command.startswith(("run services describe ", "config get-value "))
+        for command in log.read_text().splitlines()
+    )
+
+
+def test_existing_public_demo_revokes_invoker_before_deploy(fake_gcloud):
+    environment, log = fake_gcloud
+    environment.update(
+        {
+            "GCLOUD_SERVICE_EXISTS": "1",
+            "GCLOUD_AUTH_MODE": "demo",
+            "GCLOUD_PUBLIC_IAM": "1",
+        }
+    )
+    result = _run_deploy(environment, "demo-mcp", "europe-west1")
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text().splitlines()
+    revoke = next(i for i, command in enumerate(commands) if "remove-iam-policy-binding" in command)
+    deploy = next(i for i, command in enumerate(commands) if command.startswith("run deploy "))
+    assert revoke < deploy
+    assert "--member allUsers" in commands[revoke]
+    assert "--role roles/run.invoker" in commands[revoke]
+    assert "--all" in commands[revoke]
+    assert not any("add-iam-policy-binding" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    "failure,expected", [("GCLOUD_IAM_GET_ERROR", 8), ("GCLOUD_IAM_WRITE_ERROR", 9)]
+)
+def test_demo_iam_failure_stops_before_deployment(fake_gcloud, failure, expected):
+    environment, log = fake_gcloud
+    environment.update(
+        {
+            "GCLOUD_SERVICE_EXISTS": "1",
+            "GCLOUD_AUTH_MODE": "demo",
+            "GCLOUD_PUBLIC_IAM": "1",
+            failure: "1",
+        }
+    )
+    result = _run_deploy(environment, "demo-mcp", "europe-west1")
+    assert result.returncode == expected
+    assert not any(command.startswith("run deploy ") for command in log.read_text().splitlines())
+
+
+def test_github_iam_failure_is_reported_after_ready_revision(fake_gcloud):
+    environment, log = fake_gcloud
+    environment.update({"GCLOUD_SERVICE_EXISTS": "1", "GCLOUD_IAM_WRITE_ERROR": "1"})
+    result = _run_deploy(environment, "github-mcp", "europe-west1")
+    assert result.returncode == 9
+    assert "Cannot update IAM policy" in result.stderr
+    commands = log.read_text().splitlines()
+    assert "update-traffic" in commands[-2]
+    assert "add-iam-policy-binding" in commands[-1]
+    assert "Deployed:" not in result.stdout

@@ -41,41 +41,12 @@ describe_service() {
     --format "$1"
 }
 
-service_url() {
-  describe_service "value(status.url)"
-}
-
-# The mode the deployed revision actually runs in. An unset variable means the
-# application default, which is GitHub authentication.
-deployed_auth_mode() {
-  describe_service \
-    'value(spec.template.spec.containers[0].env.filter("name:MCP_AUTH_MODE").extract("value"))'
-}
-
-# Public invocation is only safe when the application authenticates its callers.
-# Demo mode has no application authentication, so it stays private.
-select_invoker_policy() {
-  case "$1" in
-    github)
-      INVOKER_ARGS=(--allow-unauthenticated)
-      PUBLIC_INVOKER=1
-      ;;
-    demo)
-      INVOKER_ARGS=(--no-allow-unauthenticated)
-      PUBLIC_INVOKER=0
-      ;;
-    *)
-      echo "Unsupported MCP_AUTH_MODE: $1 (expected github or demo)" >&2
-      exit 2
-      ;;
-  esac
-}
-
 common_deploy_args=(
   --source .
   --region "$REGION"
   --project "$PROJECT"
   --platform managed
+  --invoker-iam-check
   --memory 512Mi
   --cpu 1
   --min-instances 0
@@ -86,36 +57,89 @@ common_deploy_args=(
 
 echo "Deploying $SERVICE_NAME to $REGION (project: $PROJECT)"
 
-# A lookup that fails for any reason other than a missing service must not be
-# read as "this service is new": bootstrapping would reset the environment of a
-# running OAuth deployment.
-describe_error="$(mktemp)"
-trap 'rm -f "$describe_error"' EXIT
-describe_status=0
-SERVICE_URL="$(service_url 2>"$describe_error")" || describe_status=$?
-
-if (( describe_status != 0 )) \
-  && ! grep -qiE 'not ?found|does not exist|cannot find' "$describe_error"; then
-  cat "$describe_error" >&2
-  echo "Could not determine whether $SERVICE_NAME exists. Refusing to deploy." >&2
-  exit 1
+# Read the effective mode from the deployed service, not the operator's local
+# shell. A lookup failure must never turn an existing service into a bootstrap.
+describe_error_file="$(mktemp)"
+trap 'rm -f "$describe_error_file"' EXIT
+service_exists=false
+if service_data="$(describe_service 'json(status.url,spec.template.spec.containers)' 2>"$describe_error_file")"; then
+  service_fields="$(printf '%s' "$service_data" | python3 -c '
+import json
+import sys
+try:
+    service = json.load(sys.stdin)
+    url = service["status"]["url"]
+    environment = service["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    modes = [item for item in environment if item.get("name") == "MCP_AUTH_MODE"]
+    if len(modes) > 1:
+        raise ValueError("duplicate auth mode")
+    mode = modes[0].get("value") if modes else "github"
+    if mode not in {"github", "demo"}:
+        print("Unsupported MCP_AUTH_MODE; a literal github or demo value is required. No changes made.", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(url, str) or not url.startswith("https://") or any(c in url for c in "| \r\n"):
+        raise ValueError("missing or invalid canonical service URL")
+except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+    sys.exit("Cannot determine the deployed service URL and MCP_AUTH_MODE; no changes made.")
+print(url)
+print(mode)
+')"
+  SERVICE_URL="${service_fields%%$'\n'*}"
+  AUTH_MODE="${service_fields#*$'\n'}"
+  service_exists=true
+else
+  describe_status=$?
+  describe_error="$(<"$describe_error_file")"
+  case "$describe_error" in
+    *"Cannot find service [$SERVICE_NAME]"*|*"Service [$SERVICE_NAME] could not be found."*)
+      AUTH_MODE="${MCP_AUTH_MODE:-github}"
+      ;;
+    *)
+      echo "Could not read service state. Refusing to deploy; no changes made:" >&2
+      cat "$describe_error_file" >&2
+      exit "$describe_status"
+      ;;
+  esac
 fi
 
-if (( describe_status == 0 )) && [[ -z "$SERVICE_URL" ]]; then
-  echo "$SERVICE_NAME exists but reports no canonical URL. Refusing to deploy." >&2
-  exit 1
-fi
+case "$AUTH_MODE" in
+  github) iam_args=() ;;
+  demo) iam_args=(--no-allow-unauthenticated) ;;
+  *)
+    echo "Unsupported MCP_AUTH_MODE (expected github or demo)." >&2
+    exit 2
+    ;;
+esac
 
-if (( describe_status == 0 )); then
-  AUTH_MODE="$(deployed_auth_mode 2>/dev/null || true)"
-  select_invoker_policy "${AUTH_MODE:-github}"
-  echo "Existing service runs in ${AUTH_MODE:-github} mode"
+if [[ "$service_exists" == true ]]; then
+  # Deploy's IAM flags can turn SetIamPolicy errors into warnings. Explicitly
+  # revoke public invoker access before updating a demo and propagate failures.
+  if [[ "$AUTH_MODE" == demo ]]; then
+    iam_policy="$(gcloud run services get-iam-policy "$SERVICE_NAME" \
+      --region "$REGION" --project "$PROJECT" --format json)"
+    has_public_invoker="$(printf '%s' "$iam_policy" | python3 -c '
+import json
+import sys
+policy = json.load(sys.stdin)
+print(any(binding.get("role") == "roles/run.invoker" and "allUsers" in binding.get("members", [])
+          for binding in policy.get("bindings", [])))
+')"
+    if [[ "$has_public_invoker" == True ]]; then
+      gcloud run services remove-iam-policy-binding "$SERVICE_NAME" \
+        --region "$REGION" \
+        --project "$PROJECT" \
+        --member allUsers \
+        --role roles/run.invoker \
+        --all \
+        --quiet >/dev/null
+    fi
+  fi
 
   # Updating selected keys keeps unrelated environment variables and all
   # Secret Manager bindings intact.
   gcloud run deploy "$SERVICE_NAME" \
     "${common_deploy_args[@]}" \
-    "${INVOKER_ARGS[@]}" \
+    "${iam_args[@]}" \
     --update-env-vars "^|^BASE_URL=${SERVICE_URL}|MCP_APP=${MCP_APP}"
 
   gcloud run services update-traffic "$SERVICE_NAME" \
@@ -124,8 +148,6 @@ if (( describe_status == 0 )); then
     --to-latest \
     --quiet
 else
-  AUTH_MODE="${MCP_AUTH_MODE:-github}"
-  select_invoker_policy "$AUTH_MODE"
   case "$AUTH_MODE" in
     github)
       : "${GITHUB_CLIENT_ID:?GITHUB_CLIENT_ID is required for a new GitHub-authenticated service}"
@@ -138,9 +160,13 @@ else
       auth_env="^|^BASE_URL=http://127.0.0.1:8080|MCP_APP=${MCP_APP}|MCP_AUTH_MODE=demo"
       secret_args=()
       ;;
+    *)
+      echo "Unsupported MCP_AUTH_MODE: $AUTH_MODE (expected github or demo)" >&2
+      exit 2
+      ;;
   esac
 
-  # A new service has no canonical URL until it exists. Bootstrap a private,
+  # A new service has no canonical URL until it exists. Bootstrap a private
   # revision with a valid loopback URL, then discover status.url. gcloud does
   # not support --no-traffic when creating a service; IAM keeps it private.
   # Even explicit demo mode is unreachable during this bootstrap.
@@ -150,7 +176,7 @@ else
     "${secret_args[@]}" \
     --update-env-vars "$auth_env"
 
-  SERVICE_URL="$(service_url)"
+  SERVICE_URL="$(describe_service 'value(status.url)')"
   if [[ -z "$SERVICE_URL" ]]; then
     echo "Cloud Run did not return a canonical service URL." >&2
     exit 1
@@ -172,19 +198,20 @@ else
     --to-latest \
     --quiet
 
-  if (( PUBLIC_INVOKER == 1 )); then
-    # OAuth endpoints must be reachable by browsers and MCP clients. The
-    # application itself stays fail-closed on every request.
-    gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-      --region "$REGION" \
-      --project "$PROJECT" \
-      --member allUsers \
-      --role roles/run.invoker \
-      --quiet >/dev/null
-  else
-    echo "Demo mode has no application authentication: the service stays private."
-    echo "Grant roles/run.invoker to specific principals to reach it."
-  fi
+fi
+
+# Publish only after the GitHub-authenticated revision is ready. This explicit
+# IAM command fails the script if public access could not be configured.
+if [[ "$AUTH_MODE" == github ]]; then
+  gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+    --region "$REGION" \
+    --project "$PROJECT" \
+    --member allUsers \
+    --role roles/run.invoker \
+    --quiet >/dev/null
+else
+  echo "Demo mode has no application authentication: the service stays private."
+  echo "Grant roles/run.invoker to specific principals to reach it."
 fi
 
 echo

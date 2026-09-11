@@ -182,9 +182,15 @@ After the first deployment, set the GitHub OAuth app homepage to the printed ser
 
 The script sets a maximum of one instance because its default OAuth store is local to one instance. The limit reduces steady-state concurrency, but Cloud Run rollouts can overlap revisions, and local state still disappears on restart, including after scale-to-zero. The reference script allows scale-to-zero to avoid idle compute charges. Use shared, durable, encrypted storage before enabling scaling or relying on state across revisions. The script does not provision that storage or Secret Manager.
 
-A Cloud Run demo deployment requires `MCP_AUTH_MODE=demo` in the environment before the first deployment. Demo mode has no application authentication, so the script keeps the service private: it deploys with `--no-allow-unauthenticated` and adds no `allUsers` binding. Grant `roles/run.invoker` to named principals to reach it.
+A Cloud Run demo deployment requires `MCP_AUTH_MODE=demo` in the environment before the first deployment. Demo mode has no application authentication, so the script enables invoker IAM checks and explicitly removes any existing `allUsers` invoker binding before updating a demo. IAM read or removal failures abort before deployment. GitHub services receive public access through an explicit IAM command after the revision is ready; its failure is reported as a deployment failure. Grant `roles/run.invoker` to named principals to reach a private demo, or use an authenticated local proxy:
 
-Updates to an existing service read the deployed `MCP_AUTH_MODE` and apply the same rule, so a demo service never becomes publicly invocable through a redeploy. If the service lookup fails for any reason other than a missing service, the script stops instead of bootstrapping over a running deployment.
+```bash
+gcloud run services proxy my-mcp --region europe-west1 --project my-project --port 8080
+```
+
+Connect the MCP client to `http://localhost:8080/mcp` through that proxy.
+
+Updates to an existing service read its URL and `MCP_AUTH_MODE` together; the local shell's mode does not override deployed configuration. Lookup and unreadable-configuration failures stop the script, preserving the original lookup error status. Only an error identifying the named service as missing starts bootstrap. The script does not infer GitHub mode when it cannot read the deployed mode.
 
 ## Client setup
 

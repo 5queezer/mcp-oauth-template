@@ -2,6 +2,12 @@
 
 This project records user-visible changes in this file.
 
+## Unreleased
+
+- Require successful explicit IAM updates for Cloud Run privacy and public-access changes; deploy-command warnings no longer count as success.
+- Stop when deployed authentication configuration cannot be read, and bootstrap only when the named service is absent.
+- Declare the pinned `httpx2` test dependency directly.
+
 ## 0.3.0 - 2026-09-10
 
 ### Security
