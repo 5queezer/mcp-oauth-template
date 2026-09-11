@@ -157,10 +157,16 @@ async def search_markets(
     for event in events:
         if not isinstance(event, Mapping):
             raise ValueError("Polymarket search response contains an invalid event")
-        event_slug = _required_text(event, "slug")
+        # /public-search returns heterogeneous records. An event without usable
+        # markets or without a slug is ordinary upstream output, so it is
+        # skipped rather than failing the whole search.
         markets = event.get("markets")
-        if not isinstance(markets, list):
-            raise ValueError("Polymarket event markets must be a list")
+        if not isinstance(markets, list) or not markets:
+            continue
+        try:
+            event_slug = _required_text(event, "slug")
+        except ValueError:
+            continue
         for market in markets:
             if not isinstance(market, Mapping):
                 raise ValueError("Polymarket event contains an invalid market")

@@ -34,11 +34,41 @@ for value in "$MCP_APP" "${GITHUB_CLIENT_ID:-}" "${GITHUB_CLIENT_SECRET_REF:-}" 
   fi
 done
 
-service_url() {
+describe_service() {
   gcloud run services describe "$SERVICE_NAME" \
     --region "$REGION" \
     --project "$PROJECT" \
-    --format "value(status.url)"
+    --format "$1"
+}
+
+service_url() {
+  describe_service "value(status.url)"
+}
+
+# The mode the deployed revision actually runs in. An unset variable means the
+# application default, which is GitHub authentication.
+deployed_auth_mode() {
+  describe_service \
+    'value(spec.template.spec.containers[0].env.filter("name:MCP_AUTH_MODE").extract("value"))'
+}
+
+# Public invocation is only safe when the application authenticates its callers.
+# Demo mode has no application authentication, so it stays private.
+select_invoker_policy() {
+  case "$1" in
+    github)
+      INVOKER_ARGS=(--allow-unauthenticated)
+      PUBLIC_INVOKER=1
+      ;;
+    demo)
+      INVOKER_ARGS=(--no-allow-unauthenticated)
+      PUBLIC_INVOKER=0
+      ;;
+    *)
+      echo "Unsupported MCP_AUTH_MODE: $1 (expected github or demo)" >&2
+      exit 2
+      ;;
+  esac
 }
 
 common_deploy_args=(
@@ -56,12 +86,36 @@ common_deploy_args=(
 
 echo "Deploying $SERVICE_NAME to $REGION (project: $PROJECT)"
 
-if SERVICE_URL="$(service_url 2>/dev/null)" && [[ -n "$SERVICE_URL" ]]; then
+# A lookup that fails for any reason other than a missing service must not be
+# read as "this service is new": bootstrapping would reset the environment of a
+# running OAuth deployment.
+describe_error="$(mktemp)"
+trap 'rm -f "$describe_error"' EXIT
+describe_status=0
+SERVICE_URL="$(service_url 2>"$describe_error")" || describe_status=$?
+
+if (( describe_status != 0 )) \
+  && ! grep -qiE 'not ?found|does not exist|cannot find' "$describe_error"; then
+  cat "$describe_error" >&2
+  echo "Could not determine whether $SERVICE_NAME exists. Refusing to deploy." >&2
+  exit 1
+fi
+
+if (( describe_status == 0 )) && [[ -z "$SERVICE_URL" ]]; then
+  echo "$SERVICE_NAME exists but reports no canonical URL. Refusing to deploy." >&2
+  exit 1
+fi
+
+if (( describe_status == 0 )); then
+  AUTH_MODE="$(deployed_auth_mode 2>/dev/null || true)"
+  select_invoker_policy "${AUTH_MODE:-github}"
+  echo "Existing service runs in ${AUTH_MODE:-github} mode"
+
   # Updating selected keys keeps unrelated environment variables and all
   # Secret Manager bindings intact.
   gcloud run deploy "$SERVICE_NAME" \
     "${common_deploy_args[@]}" \
-    --allow-unauthenticated \
+    "${INVOKER_ARGS[@]}" \
     --update-env-vars "^|^BASE_URL=${SERVICE_URL}|MCP_APP=${MCP_APP}"
 
   gcloud run services update-traffic "$SERVICE_NAME" \
@@ -71,6 +125,7 @@ if SERVICE_URL="$(service_url 2>/dev/null)" && [[ -n "$SERVICE_URL" ]]; then
     --quiet
 else
   AUTH_MODE="${MCP_AUTH_MODE:-github}"
+  select_invoker_policy "$AUTH_MODE"
   case "$AUTH_MODE" in
     github)
       : "${GITHUB_CLIENT_ID:?GITHUB_CLIENT_ID is required for a new GitHub-authenticated service}"
@@ -82,10 +137,6 @@ else
     demo)
       auth_env="^|^BASE_URL=http://127.0.0.1:8080|MCP_APP=${MCP_APP}|MCP_AUTH_MODE=demo"
       secret_args=()
-      ;;
-    *)
-      echo "Unsupported MCP_AUTH_MODE: $AUTH_MODE (expected github or demo)" >&2
-      exit 2
       ;;
   esac
 
@@ -121,14 +172,19 @@ else
     --to-latest \
     --quiet
 
-  # OAuth endpoints must be reachable by browsers and MCP clients. Application
-  # authorization remains fail-closed unless demo mode was explicitly chosen.
-  gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-    --region "$REGION" \
-    --project "$PROJECT" \
-    --member allUsers \
-    --role roles/run.invoker \
-    --quiet >/dev/null
+  if (( PUBLIC_INVOKER == 1 )); then
+    # OAuth endpoints must be reachable by browsers and MCP clients. The
+    # application itself stays fail-closed on every request.
+    gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+      --region "$REGION" \
+      --project "$PROJECT" \
+      --member allUsers \
+      --role roles/run.invoker \
+      --quiet >/dev/null
+  else
+    echo "Demo mode has no application authentication: the service stays private."
+    echo "Grant roles/run.invoker to specific principals to reach it."
+  fi
 fi
 
 echo

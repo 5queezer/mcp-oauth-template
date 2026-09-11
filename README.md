@@ -176,13 +176,15 @@ export GITHUB_CLIENT_SECRET_REF='github-client-secret:latest'
 ./deploy.sh my-mcp europe-west1 my-project examples.github_oauth_server:build_app
 ```
 
-The script creates a private bootstrap revision with a loopback URL, discovers Cloud Run's canonical URL, and updates `BASE_URL` on a new revision before switching traffic. Only then does it grant `allUsers` the Cloud Run invoker role. The initial revision uses private IAM because `gcloud` does not support `--no-traffic` when creating a service. MCP clients and browser redirects need public network access; the application enforces GitHub authentication.
+The script creates a private bootstrap revision with a loopback URL, discovers Cloud Run's canonical URL, and updates `BASE_URL` on a new revision before switching traffic. Only then, and only in GitHub mode, does it grant `allUsers` the Cloud Run invoker role. The initial revision uses private IAM because `gcloud` does not support `--no-traffic` when creating a service. MCP clients and browser redirects need public network access; the application enforces GitHub authentication.
 
 After the first deployment, set the GitHub OAuth app homepage to the printed service URL and its callback to `<service-url>/auth/callback`. Existing-service deployments preserve unrelated environment variables and Secret Manager bindings while updating `BASE_URL` and `MCP_APP`.
 
 The script sets a maximum of one instance because its default OAuth store is local to one instance. The limit reduces steady-state concurrency, but Cloud Run rollouts can overlap revisions, and local state still disappears on restart, including after scale-to-zero. The reference script allows scale-to-zero to avoid idle compute charges. Use shared, durable, encrypted storage before enabling scaling or relying on state across revisions. The script does not provision that storage or Secret Manager.
 
-An anonymous Cloud Run demo requires `MCP_AUTH_MODE=demo` in the environment before the first deployment. That setting exposes the selected tools without application authentication.
+A Cloud Run demo deployment requires `MCP_AUTH_MODE=demo` in the environment before the first deployment. Demo mode has no application authentication, so the script keeps the service private: it deploys with `--no-allow-unauthenticated` and adds no `allUsers` binding. Grant `roles/run.invoker` to named principals to reach it.
+
+Updates to an existing service read the deployed `MCP_AUTH_MODE` and apply the same rule, so a demo service never becomes publicly invocable through a redeploy. If the service lookup fails for any reason other than a missing service, the script stops instead of bootstrapping over a running deployment.
 
 ## Client setup
 

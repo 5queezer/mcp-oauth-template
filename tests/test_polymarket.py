@@ -108,6 +108,43 @@ def test_search_markets_returns_empty_list_for_no_matching_events(
     assert asyncio.run(polymarket_server.search_markets("no matches")) == []
 
 
+def test_search_markets_skips_events_without_usable_markets_or_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "events": [
+                    {"title": "No markets key"},
+                    {"title": "Empty markets", "slug": "empty", "markets": []},
+                    {
+                        "title": "Missing slug",
+                        "markets": [{"question": "Q", "slug": "orphan"}],
+                    },
+                    {
+                        "title": "Usable",
+                        "slug": "usable-event",
+                        "markets": [
+                            {
+                                "question": "Will it resolve?",
+                                "slug": "will-it-resolve",
+                                "outcomes": '["Yes", "No"]',
+                                "outcomePrices": '["0.5", "0.5"]',
+                            }
+                        ],
+                    },
+                ]
+            },
+        ),
+    )
+
+    result = asyncio.run(polymarket_server.search_markets("bitcoin"))
+
+    assert [market["slug"] for market in result] == ["will-it-resolve"]
+
+
 @pytest.mark.parametrize("limit", [0, 101])
 def test_search_markets_rejects_out_of_range_limits(
     monkeypatch: pytest.MonkeyPatch, limit: int

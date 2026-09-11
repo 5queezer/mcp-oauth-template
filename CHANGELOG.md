@@ -9,6 +9,8 @@ This project records user-visible changes in this file.
 - Replaced the custom authorization server with FastMCP's maintained GitHub OAuth provider.
 - Added downstream client consent and native PKCE, client, redirect, resource, and browser-state binding.
 - Enforced a nonempty allowlist of immutable numeric GitHub IDs on each bearer request.
+- Kept demo deployments private: public Cloud Run invocation is granted only in GitHub mode, on new and existing services alike.
+- Stopped the deployment script when a service lookup fails for any reason other than a missing service, so it cannot bootstrap over a running OAuth deployment.
 - Made GitHub authentication the default and required an explicit `demo` mode for anonymous access.
 
 ### Changed

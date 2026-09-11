@@ -26,10 +26,19 @@ if [[ "$*" == "config get-value project" ]]; then
 fi
 
 if [[ "$*" == run\\ services\\ describe* ]]; then
+  if [[ "${GCLOUD_DESCRIBE_FAILS:-0}" == "1" ]]; then
+    echo "ERROR: (gcloud.run.services.describe) PERMISSION_DENIED: caller lacks permission" >&2
+    exit 1
+  fi
   if [[ "${GCLOUD_SERVICE_EXISTS:-0}" == "1" || -f "$GCLOUD_DEPLOYED" ]]; then
-    printf '%s\\n' "https://canonical-service-uc.a.run.app"
+    if [[ "$*" == *MCP_AUTH_MODE* ]]; then
+      printf '%s\\n' "${GCLOUD_DEPLOYED_AUTH_MODE:-}"
+    else
+      printf '%s\\n' "https://canonical-service-uc.a.run.app"
+    fi
     exit 0
   fi
+  echo "ERROR: (gcloud.run.services.describe) Cannot find service [unknown]." >&2
   exit 1
 fi
 
@@ -173,3 +182,62 @@ def test_new_demo_service_requires_explicit_mode(
     )
     assert "MCP_AUTH_MODE=demo" in bootstrap
     assert "--no-allow-unauthenticated" in bootstrap
+
+
+def test_existing_demo_service_stays_private(
+    fake_gcloud: tuple[dict[str, str], Path],
+) -> None:
+    environment, log = fake_gcloud
+    environment["GCLOUD_SERVICE_EXISTS"] = "1"
+    environment["GCLOUD_DEPLOYED_AUTH_MODE"] = "demo"
+
+    result = _run_deploy(environment, "demo-mcp", "us-central1")
+
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text().splitlines()
+    deploy = next(command for command in commands if command.startswith("run deploy "))
+    assert "--no-allow-unauthenticated" in deploy
+    assert "--allow-unauthenticated" not in deploy.replace("--no-allow-unauthenticated", "")
+    assert not any("add-iam-policy-binding" in command for command in commands)
+
+
+def test_existing_service_rejects_unsupported_deployed_mode(
+    fake_gcloud: tuple[dict[str, str], Path],
+) -> None:
+    environment, log = fake_gcloud
+    environment["GCLOUD_SERVICE_EXISTS"] = "1"
+    environment["GCLOUD_DEPLOYED_AUTH_MODE"] = "anonymous"
+
+    result = _run_deploy(environment, "odd-mcp", "us-central1")
+
+    assert result.returncode == 2
+    assert "Unsupported MCP_AUTH_MODE" in result.stderr
+    assert not any(command.startswith("run deploy ") for command in log.read_text().splitlines())
+
+
+def test_new_demo_service_never_becomes_publicly_invocable(
+    fake_gcloud: tuple[dict[str, str], Path],
+) -> None:
+    environment, log = fake_gcloud
+    environment["MCP_AUTH_MODE"] = "demo"
+
+    result = _run_deploy(environment, "demo-mcp", "us-central1")
+
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text().splitlines()
+    assert not any("add-iam-policy-binding" in command for command in commands)
+    assert not any("--member allUsers" in command for command in commands)
+    assert "stays private" in result.stdout
+
+
+def test_lookup_failure_does_not_bootstrap_over_an_existing_service(
+    fake_gcloud: tuple[dict[str, str], Path],
+) -> None:
+    environment, log = fake_gcloud
+    environment["GCLOUD_DESCRIBE_FAILS"] = "1"
+
+    result = _run_deploy(environment, "technical-mcp", "us-central1")
+
+    assert result.returncode == 1
+    assert "Refusing to deploy" in result.stderr
+    assert not any(command.startswith("run deploy ") for command in log.read_text().splitlines())
