@@ -170,13 +170,18 @@ async def search_markets(
         for market in markets:
             if not isinstance(market, Mapping):
                 raise ValueError("Polymarket event contains an invalid market")
-            results.append(
-                _market_summary(
+            # An incomplete market is skipped for the same reason an unusable
+            # event is. _market_summary stays strict so that get_market_by_slug,
+            # a direct lookup of one named market, keeps failing loudly.
+            try:
+                summary = _market_summary(
                     market,
                     event_title=event.get("title"),
                     event_slug=event_slug,
                 )
-            )
+            except ValueError:
+                continue
+            results.append(summary)
             if len(results) == limit:
                 return results
     return results

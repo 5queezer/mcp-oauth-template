@@ -145,6 +145,85 @@ def test_search_markets_skips_events_without_usable_markets_or_slug(
     assert [market["slug"] for market in result] == ["will-it-resolve"]
 
 
+def test_search_markets_skips_incomplete_markets_and_keeps_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "title": "Mixed event",
+                        "slug": "mixed-event",
+                        "markets": [
+                            {
+                                "slug": "missing-question",
+                                "outcomes": '["Yes", "No"]',
+                                "outcomePrices": '["0.5", "0.5"]',
+                            },
+                            {"question": "Missing slug?", "outcomes": '["Yes"]'},
+                            {
+                                "question": "Missing prices?",
+                                "slug": "missing-prices",
+                                "outcomes": '["Yes", "No"]',
+                            },
+                            {
+                                "question": "Mismatched lengths?",
+                                "slug": "mismatched-lengths",
+                                "outcomes": '["Yes", "No"]',
+                                "outcomePrices": '["0.5"]',
+                            },
+                            {
+                                "question": "Will it resolve?",
+                                "slug": "will-it-resolve",
+                                "outcomes": '["Yes", "No"]',
+                                "outcomePrices": '["0.4", "0.6"]',
+                            },
+                        ],
+                    }
+                ]
+            },
+        ),
+    )
+
+    result = asyncio.run(polymarket_server.search_markets("bitcoin"))
+
+    assert result == [
+        {
+            "question": "Will it resolve?",
+            "slug": "will-it-resolve",
+            "outcome_prices": {"Yes": 0.4, "No": 0.6},
+            "volume_24h": None,
+            "liquidity": None,
+            "end_date": None,
+            "event": "Mixed event",
+            "url": "https://polymarket.com/event/mixed-event",
+        }
+    ]
+
+
+def test_get_market_by_slug_still_rejects_an_incomplete_market(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "slug": "missing-question",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.5", "0.5"]',
+                "events": [{"title": "Parent", "slug": "parent-event"}],
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="missing question"):
+        asyncio.run(polymarket_server.get_market_by_slug("missing-question"))
+
+
 @pytest.mark.parametrize("limit", [0, 101])
 def test_search_markets_rejects_out_of_range_limits(
     monkeypatch: pytest.MonkeyPatch, limit: int
