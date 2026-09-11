@@ -12,6 +12,7 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy.sh"
 
 @pytest.fixture
 def fake_gcloud(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """Simulate service discovery and IAM failures without contacting Google Cloud."""
     executable = tmp_path / "gcloud"
     log = tmp_path / "gcloud.log"
     deployed = tmp_path / "deployed"
@@ -83,6 +84,7 @@ elif args[:2] == ["run", "deploy"]:
 
 
 def _run_deploy(environment: dict[str, str], *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run the real deployment script with the supplied fake Cloud SDK environment."""
     return subprocess.run(
         ["bash", str(DEPLOY_SCRIPT), *arguments],
         cwd=REPO_ROOT,
@@ -96,6 +98,7 @@ def _run_deploy(environment: dict[str, str], *arguments: str) -> subprocess.Comp
 def test_existing_service_preserves_configuration_and_selects_application(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Update the selected factory without replacing unrelated environment or secret bindings."""
     environment, log = fake_gcloud
     environment["GCLOUD_SERVICE_EXISTS"] = "1"
 
@@ -128,6 +131,7 @@ def test_existing_service_preserves_configuration_and_selects_application(
 def test_new_service_bootstraps_privately_then_uses_discovered_url(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Expose a new GitHub service only after its canonical URL and revision are ready."""
     environment, log = fake_gcloud
     environment.update(
         {
@@ -174,6 +178,7 @@ def test_new_service_bootstraps_privately_then_uses_discovered_url(
 def test_new_github_service_fails_closed_without_credentials(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Reject missing bootstrap credentials before any service can be created."""
     environment, log = fake_gcloud
     for name in (
         "GITHUB_CLIENT_ID",
@@ -192,6 +197,7 @@ def test_new_github_service_fails_closed_without_credentials(
 def test_new_demo_service_requires_explicit_mode(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Allow an explicitly selected demo to bootstrap with private invocation settings."""
     environment, log = fake_gcloud
     environment["MCP_AUTH_MODE"] = "demo"
 
@@ -208,6 +214,7 @@ def test_new_demo_service_requires_explicit_mode(
 def test_existing_demo_service_stays_private(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Retain private invocation when updating an existing demo service."""
     environment, log = fake_gcloud
     environment["GCLOUD_SERVICE_EXISTS"] = "1"
     environment["GCLOUD_DEPLOYED_AUTH_MODE"] = "demo"
@@ -225,6 +232,7 @@ def test_existing_demo_service_stays_private(
 def test_existing_service_rejects_unsupported_deployed_mode(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Refuse an unknown deployed mode instead of guessing its authentication policy."""
     environment, log = fake_gcloud
     environment["GCLOUD_SERVICE_EXISTS"] = "1"
     environment["GCLOUD_DEPLOYED_AUTH_MODE"] = "anonymous"
@@ -239,6 +247,7 @@ def test_existing_service_rejects_unsupported_deployed_mode(
 def test_new_demo_service_never_becomes_publicly_invocable(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Never grant anonymous invocation to an application without its own authentication."""
     environment, log = fake_gcloud
     environment["MCP_AUTH_MODE"] = "demo"
 
@@ -254,6 +263,7 @@ def test_new_demo_service_never_becomes_publicly_invocable(
 def test_lookup_failure_does_not_bootstrap_over_an_existing_service(
     fake_gcloud: tuple[dict[str, str], Path],
 ) -> None:
+    """Treat a failed existence lookup as an error rather than permission to bootstrap."""
     environment, log = fake_gcloud
     environment["GCLOUD_DESCRIBE_FAILS"] = "1"
 
@@ -266,6 +276,7 @@ def test_lookup_failure_does_not_bootstrap_over_an_existing_service(
 
 @pytest.mark.parametrize("remote_mode", ["github", "demo", "__missing__"])
 def test_existing_service_uses_deployed_mode_for_iam(fake_gcloud, remote_mode):
+    """Use remote configuration even when the local shell selects the opposite mode."""
     environment, log = fake_gcloud
     environment.update(
         {
@@ -299,6 +310,7 @@ def test_existing_service_uses_deployed_mode_for_iam(fake_gcloud, remote_mode):
     ],
 )
 def test_describe_failure_never_bootstraps_a_service(fake_gcloud, error):
+    """Preserve lookup errors even when credentials would permit a bootstrap deployment."""
     environment, log = fake_gcloud
     environment.update(
         {
@@ -326,6 +338,7 @@ def test_describe_failure_never_bootstraps_a_service(fake_gcloud, error):
     ],
 )
 def test_unreadable_deployed_config_fails_before_mutation(fake_gcloud, mode, url):
+    """Avoid cloud mutations when the canonical URL or authentication mode is unusable."""
     environment, log = fake_gcloud
     environment.update(
         {"GCLOUD_SERVICE_EXISTS": "1", "GCLOUD_AUTH_MODE": mode, "GCLOUD_SERVICE_URL": url}
@@ -339,6 +352,7 @@ def test_unreadable_deployed_config_fails_before_mutation(fake_gcloud, mode, url
 
 
 def test_existing_public_demo_revokes_invoker_before_deploy(fake_gcloud):
+    """Remove public access before deploying another revision of an existing demo."""
     environment, log = fake_gcloud
     environment.update(
         {
@@ -363,6 +377,7 @@ def test_existing_public_demo_revokes_invoker_before_deploy(fake_gcloud):
     "failure,expected", [("GCLOUD_IAM_GET_ERROR", 8), ("GCLOUD_IAM_WRITE_ERROR", 9)]
 )
 def test_demo_iam_failure_stops_before_deployment(fake_gcloud, failure, expected):
+    """Fail before deployment when private invocation cannot be verified or enforced."""
     environment, log = fake_gcloud
     environment.update(
         {
@@ -378,6 +393,7 @@ def test_demo_iam_failure_stops_before_deployment(fake_gcloud, failure, expected
 
 
 def test_github_iam_failure_is_reported_after_ready_revision(fake_gcloud):
+    """Do not report success when the ready GitHub service cannot be made reachable."""
     environment, log = fake_gcloud
     environment.update({"GCLOUD_SERVICE_EXISTS": "1", "GCLOUD_IAM_WRITE_ERROR": "1"})
     result = _run_deploy(environment, "github-mcp", "europe-west1")
