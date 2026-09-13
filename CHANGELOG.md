@@ -7,6 +7,10 @@ This project records user-visible changes in this file.
 - Make the README easier to navigate and follow.
 - Create a GitHub release from the package version after all main-branch CI jobs pass.
 - Skip publication when a release for that version already exists.
+- Require successful explicit IAM updates for Cloud Run privacy and public-access changes; deploy-command warnings no longer count as success.
+- Stop when deployed authentication configuration cannot be read, and bootstrap only when the named service is absent.
+- Declare the pinned `httpx2` test dependency directly.
+- Update container images to Python 3.14 and uv 0.12.13.
 
 ## 0.3.0 - 2026-09-10
 
