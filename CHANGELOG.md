@@ -2,6 +2,12 @@
 
 This project records user-visible changes in this file.
 
+## 0.3.1 - 2026-09-14
+
+- Make the README easier to navigate and follow.
+- Create a GitHub release from the package version after all main-branch CI jobs pass.
+- Skip publication when a release for that version already exists.
+
 ## 0.3.0 - 2026-09-10
 
 ### Security
