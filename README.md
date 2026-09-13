@@ -259,6 +259,8 @@ MCP clients and browser redirects need public network access. The application en
 
 For an existing service, the script updates `BASE_URL` and `MCP_APP`.
 It preserves unrelated environment variables and Secret Manager bindings.
+GitHub services receive public access through an explicit IAM command after the revision is ready.
+If that command fails, the script reports a deployment failure.
 
 ### Storage and scaling limits
 
@@ -275,13 +277,23 @@ It does not provision shared storage or Secret Manager.
 
 Set `MCP_AUTH_MODE=demo` in your environment before the first demo deployment.
 Demo mode has no application authentication.
-The script keeps the service private with `--no-allow-unauthenticated` and adds no `allUsers` binding.
-Grant `roles/run.invoker` to named principals who need access.
+The script enables invoker IAM checks and removes any existing `allUsers` invoker binding before updating a demo.
+IAM read or removal failures stop the script before deployment.
 
-For existing services, the script reads the deployed `MCP_AUTH_MODE` and applies the same access rule.
-A redeploy therefore does not make a demo service publicly invocable.
-If a service lookup fails, the script stops unless the error identifies a missing service.
-This prevents it from bootstrapping over a running deployment.
+Grant `roles/run.invoker` to named principals who need access.
+You can also use an authenticated local proxy:
+
+```bash
+gcloud run services proxy my-mcp --region europe-west1 --project my-project --port 8080
+```
+
+Connect the MCP client to `http://localhost:8080/mcp` through that proxy.
+
+For existing services, the script reads the service URL and deployed `MCP_AUTH_MODE` together.
+The local shell's mode does not override deployed configuration.
+Lookup failures and unreadable configuration stop the script. The script preserves the original lookup error status.
+Only an error identifying the named service as missing starts bootstrap.
+The script does not infer GitHub mode when it cannot read the deployed mode.
 
 ## Public API
 
