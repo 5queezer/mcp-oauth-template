@@ -1,23 +1,43 @@
 # mcp-oauth-template
 
-A small Python template for serving a remote [Model Context Protocol](https://modelcontextprotocol.io/) server with FastMCP and GitHub OAuth.
+Build a remote [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server with Python, FastMCP, and GitHub OAuth.
 
-The repository keeps authentication policy in one place, uses FastMCP's maintained [GitHub OAuth provider](https://gofastmcp.com/integrations/github), and ships a container entrypoint that runs a selected application factory. GitHub OAuth is the default. Anonymous access requires `MCP_AUTH_MODE=demo`.
+This template keeps authentication policy in one place and uses FastMCP's maintained [GitHub OAuth provider](https://gofastmcp.com/integrations/github).
+The container runs the application factory you select.
+GitHub OAuth is the default. Anonymous access requires `MCP_AUTH_MODE=demo`.
 
-Version 0.3.0 replaces the custom OAuth server from 0.2.x. Existing users should read the [migration guide](docs/migration.md).
+**Upgrading from 0.2.x?** Version 0.3.0 replaces the custom OAuth server. Read the [migration guide](docs/migration.md) first.
+
+## On this page
+
+- [Requirements](#requirements)
+- [Local quick start](#local-quick-start)
+- [GitHub OAuth](#github-oauth)
+- [Client setup](#client-setup)
+- [Build an application](#build-an-application)
+- [Configuration](#configuration)
+- [Container](#container)
+- [Cloud Run reference deployment](#cloud-run-reference-deployment)
+- [Public API](#public-api)
+- [OAuth and storage model](#oauth-and-storage-model)
+- [Development](#development)
+- [License](#license)
 
 ## Requirements
 
+For local development, install:
+
 - Python 3.12, 3.13, or 3.14
 - [uv](https://docs.astral.sh/uv/)
-- Docker for the container checks
-- Google Cloud CLI for the optional Cloud Run deployment
 
-The committed `uv.lock` defines the tested dependency set. The package metadata allows compatible FastMCP 4.x releases, while CI installs the lockfile with `--frozen` and uv 0.12.12.
+You also need Docker for container checks, or Google Cloud CLI for the optional Cloud Run deployment.
+
+The committed `uv.lock` defines the tested dependencies. Package metadata allows compatible FastMCP 4.x releases.
+CI installs the lockfile with `--frozen` and uv 0.12.12.
 
 ## Local quick start
 
-Clone the repository and install the development environment:
+### 1. Install the project
 
 ```bash
 git clone https://github.com/5queezer/mcp-oauth-template.git
@@ -25,37 +45,89 @@ cd mcp-oauth-template
 uv sync --frozen --group dev
 ```
 
-Start the neutral echo example in explicit demo mode:
+### 2. Start the echo example
+
+**Demo mode has no application authentication. Use it only on a trusted network.**
 
 ```bash
 HOST=127.0.0.1 MCP_AUTH_MODE=demo uv run python -m mcp_server
 ```
 
-The server listens on `http://localhost:8080`. Its MCP endpoint is `/mcp`, and `curl http://localhost:8080/health` returns a process health check. Demo mode has no application authentication; use it only on a trusted network.
+The server listens on `http://localhost:8080`.
+
+### 3. Check the server
+
+Run this command in another terminal:
+
+```bash
+curl http://localhost:8080/health
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `http://localhost:8080/health` | Process health check |
+| `http://localhost:8080/mcp` | MCP client connection |
 
 ## GitHub OAuth
 
-Create a GitHub OAuth app with these values for local development:
+### 1. Create a GitHub OAuth app
+
+Use these values for local development:
 
 | GitHub setting | Value |
 | --- | --- |
 | Homepage URL | `http://localhost:8080` |
 | Authorization callback URL | `http://localhost:8080/auth/callback` |
 
-Copy the configuration template, add the OAuth app credentials, and list the numeric GitHub user IDs that may connect:
+### 2. Configure credentials and allowed users
+
+Copy the configuration template:
 
 ```bash
 cp .env.example .env
+```
+
+Edit `.env`:
+
+- Set `GITHUB_CLIENT_ID` to the OAuth app client ID.
+- Set `GITHUB_CLIENT_SECRET` to the OAuth app client secret.
+- Set `GITHUB_ALLOWED_USER_IDS` to the comma-separated numeric GitHub IDs of users who may connect.
+
+GitHub returns the immutable numeric ID in the `id` field of `GET https://api.github.com/users/{login}`.
+Do not use account names in `GITHUB_ALLOWED_USER_IDS`. Account names can change.
+
+### 3. Start the authenticated server
+
+Stop the demo server first if it still uses port 8080.
+
+```bash
 uv run --env-file .env python -m mcp_server
 ```
 
-GitHub exposes the immutable numeric ID as the `id` field in `GET https://api.github.com/users/{login}`. Do not use mutable account names in `GITHUB_ALLOWED_USER_IDS`.
+### GitHub permissions
 
-The provider requests [`read:user`](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps). That scope supports profile identity and does not grant access to private repositories. The GitHub example limits its repository tools to public data; it never returns the upstream access token.
+The provider requests the [`read:user`](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps) scope for profile identity.
+This scope does not grant access to private repositories.
+The GitHub example uses public repository data only and never returns the upstream access token.
+
+## Client setup
+
+Connect an MCP client that supports remote OAuth to your server's `/mcp` URL.
+
+For Claude, follow Anthropic's [custom connector guide](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp):
+
+- Individual users start under **Customize > Connectors**.
+- Organization administrators use **Organization settings**.
+
+The repository tests protocol discovery and a real HTTP MCP flow.
+Maintainers did not test this release with live GitHub OAuth, Claude, or Cloud Run credentials.
 
 ## Build an application
 
-Export an import-safe `build_app` factory. Construct the auth provider inside the factory so imports, packaging checks, and tooling do not require secrets.
+### Create a factory
+
+Export a `build_app` factory that callers can import without secrets.
+Construct the authentication provider inside the factory. This keeps imports, packaging checks, and tooling independent of secrets.
 
 ```python
 # examples/my_service.py
@@ -76,75 +148,50 @@ def build_app() -> Starlette:
     return create_app(mcp, allow_anonymous=auth is None)
 ```
 
-Select the factory through `MCP_APP`:
+### Run your factory
+
+Select the factory with `MCP_APP`:
 
 ```bash
 MCP_APP=examples.my_service:build_app uv run --env-file .env python -m mcp_server
 ```
 
-`auth_from_env()` returns `None` only when `MCP_AUTH_MODE=demo`. The `allow_anonymous` expression above therefore preserves the explicit opt-in. The launcher uses one Uvicorn worker.
+`auth_from_env()` returns `None` only when `MCP_AUTH_MODE=demo`.
+The `allow_anonymous` expression therefore permits anonymous access only in demo mode.
+The launcher uses one Uvicorn worker.
 
-The container copies `mcp_server/` and `examples/` instead of the whole build context. Keep custom factories in one of those packages, or add their package to the Dockerfile's explicit copy steps.
+The container copies only `mcp_server/` and `examples/` from the build context.
+Keep custom factories in one of these packages. For another package, add a copy step to the Dockerfile.
 
-The repository includes three factories:
+### Included examples
 
 | Factory | Purpose |
 | --- | --- |
-| `examples.echo_server:build_app` | Deterministic echo smoke test; container default |
+| `examples.echo_server:build_app` | Deterministic echo smoke test. Container default. |
 | `examples.github_oauth_server:build_app` | Caller identity and public GitHub data with the caller's credential |
 | `examples.polymarket_server:build_app` | Read-only Polymarket event and market search |
 
-The GitHub example requires GitHub mode. The other examples may run in demo mode for local testing.
-
-## Public API
-
-```text
-create_app(mcp: FastMCP, *, allow_anonymous: bool = False,
-           cors_origins: list[str] | None = None)
-```
-
-`create_app` serves stateless JSON MCP transport at `/mcp`, adds `/health`, and rejects an MCP server without authentication unless `allow_anonymous=True`. Its default browser CORS origin is `https://claude.ai`; pass the exact origins for other browser clients.
-
-`auth_from_env()` selects the configured auth mode. `GitHubAuthProvider` enforces the numeric-ID allowlist on each bearer request. `get_current_sub()` reads the current request's native subject and returns `None` outside an authenticated request.
-
-Advanced users can construct the provider and supply an alternate store:
-
-```text
-GitHubAuthProvider(*, allowed_user_ids: Collection[str], client_id: str,
-                   client_secret: str, base_url: str,
-                   encrypted_storage: AsyncKeyValue | None = None)
-```
-
-FastMCP encrypts its default file store. A store supplied through `encrypted_storage` must encrypt its values before persistence.
-
-Tools that call GitHub can obtain the current upstream credential through FastMCP's `get_access_token()` dependency. Treat `AccessToken.token` as a secret: use it only in the outbound authorization header and keep it out of logs and tool results.
+The GitHub example requires GitHub mode. The other examples can use demo mode for local testing.
 
 ## Configuration
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
-| `MCP_AUTH_MODE` | No | `github` by default; `demo` opts into anonymous access |
-| `BASE_URL` | GitHub mode | Public origin, without a path, query, fragment, or credentials |
+| `MCP_AUTH_MODE` | No | Defaults to `github`. Use `demo` for anonymous access. |
+| `BASE_URL` | GitHub mode | Public origin without a path, query, fragment, or credentials |
 | `GITHUB_CLIENT_ID` | GitHub mode | GitHub OAuth app client ID |
 | `GITHUB_CLIENT_SECRET` | GitHub mode | GitHub OAuth app client secret |
 | `GITHUB_ALLOWED_USER_IDS` | GitHub mode | Comma-separated positive numeric GitHub IDs |
-| `MCP_APP` | No | `module:factory`; defaults to `examples.echo_server:build_app` |
-| `FASTMCP_HOME` | No | Directory used by FastMCP for encrypted OAuth state |
+| `MCP_APP` | No | `module:factory`. Defaults to `examples.echo_server:build_app`. |
+| `FASTMCP_HOME` | No | Directory for FastMCP's encrypted OAuth state |
 | `HOST`, `PORT`, `LOG_LEVEL` | No | Uvicorn process settings |
 
-`BASE_URL` must use HTTPS. The provider permits HTTP only for `localhost`, `127.0.0.1`, and `::1`. It rejects the removed `ADMIN_PASSWORD` setting so an obsolete deployment cannot fall through to anonymous access.
+`BASE_URL` must use HTTPS. The provider permits HTTP only for `localhost`, `127.0.0.1`, and `::1`.
+The provider rejects the removed `ADMIN_PASSWORD` setting. This prevents an obsolete deployment from allowing anonymous access.
 
-The application reads auth configuration when it builds the factory. Restart the local process or create a new service revision after changing the mode, credentials, allowlist, or base URL.
-
-## OAuth and storage model
-
-FastMCP supplies client registration, PKCE, downstream consent, browser-bound state, client and redirect binding, token issuance, and protected-resource discovery. The provider supports Client ID Metadata Documents and Dynamic Client Registration for compatible MCP clients. The locked FastMCP 4.0.3 and MCP SDK 2.2.0 stack negotiates MCP protocol version `2025-11-25` in the repository's HTTP tests. See the current [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/) for the broader protocol contract.
-
-The server issues one-hour FastMCP access tokens and validates GitHub access without an upstream verification cache. FastMCP stores registrations and token mappings in an encrypted file store under `FASTMCP_HOME` when you do not inject another store. A custom store must provide encryption itself.
-
-GitHub does not expose an OAuth token-revocation endpoint for this provider, so the server does not advertise a local `/revoke` route. Revoke the OAuth app grant from the user's GitHub application settings to invalidate the GitHub credential. Token expiry, revocation, a new revision, or lost local storage may require the MCP client to reconnect; client refresh behavior varies, and this project does not promise an automatic refresh flow.
-
-Dynamic client registration and consent endpoints must remain reachable by MCP clients and browsers. This template does not add ingress rate limits, registration quotas, or storage monitoring. An internet-facing operator should apply abuse controls at the edge and set an operational policy for storage growth and retention.
+The application reads authentication configuration when the factory runs.
+Restart the local process after you change the mode, credentials, allowlist, or base URL.
+For a deployed service, create a new revision.
 
 ## Container
 
@@ -154,11 +201,21 @@ Build and smoke-test the image:
 make docker-smoke
 ```
 
-The image runs `python -m mcp_server` as UID/GID 10001, launches one worker, and sets `FASTMCP_HOME=/data/fastmcp`. Set `MCP_APP` and the auth variables at runtime. The smoke test starts the echo factory in demo mode and checks the health route and MCP tool list.
+The image:
 
-`/data/fastmcp` is writable container storage. Mount durable storage if the runtime supports it. Cloud Run's container filesystem is ephemeral.
+- Runs `python -m mcp_server` as UID/GID 10001.
+- Starts one worker.
+- Sets `FASTMCP_HOME=/data/fastmcp`.
+
+Set `MCP_APP` and the authentication variables at runtime.
+The smoke test starts the echo factory in demo mode. It checks the health route and MCP tool list.
+
+`/data/fastmcp` is writable container storage. Mount durable storage if the runtime supports it.
+Cloud Run's container filesystem is temporary.
 
 ## Cloud Run reference deployment
+
+### Deploy with GitHub OAuth
 
 The script accepts a service, region, optional project, and optional application factory:
 
@@ -166,7 +223,11 @@ The script accepts a service, region, optional project, and optional application
 ./deploy.sh <service-name> <region> [project-id] [module:factory]
 ```
 
-For a first GitHub deployment, create the secret in Secret Manager and grant the Cloud Run runtime service account access to it. Then run:
+Before the first deployment:
+
+1. Create the GitHub client secret in Secret Manager.
+2. Grant the Cloud Run runtime service account access to that secret.
+3. Set the deployment variables and run the script:
 
 ```bash
 export GITHUB_CLIENT_ID='your-oauth-app-client-id'
@@ -176,34 +237,164 @@ export GITHUB_CLIENT_SECRET_REF='github-client-secret:latest'
 ./deploy.sh my-mcp europe-west1 my-project examples.github_oauth_server:build_app
 ```
 
-The script creates a private bootstrap revision with a loopback URL, discovers Cloud Run's canonical URL, and updates `BASE_URL` on a new revision before switching traffic. Only then, and only in GitHub mode, does it grant `allUsers` the Cloud Run invoker role. The initial revision uses private IAM because `gcloud` does not support `--no-traffic` when creating a service. MCP clients and browser redirects need public network access; the application enforces GitHub authentication.
+After the first deployment, update the GitHub OAuth app:
 
-After the first deployment, set the GitHub OAuth app homepage to the printed service URL and its callback to `<service-url>/auth/callback`. Existing-service deployments preserve unrelated environment variables and Secret Manager bindings while updating `BASE_URL` and `MCP_APP`.
+| GitHub setting | Value |
+| --- | --- |
+| Homepage URL | The service URL printed by the script |
+| Authorization callback URL | `<service-url>/auth/callback` |
 
-The script sets a maximum of one instance because its default OAuth store is local to one instance. The limit reduces steady-state concurrency, but Cloud Run rollouts can overlap revisions, and local state still disappears on restart, including after scale-to-zero. The reference script allows scale-to-zero to avoid idle compute charges. Use shared, durable, encrypted storage before enabling scaling or relying on state across revisions. The script does not provision that storage or Secret Manager.
+### Deployment sequence
 
-A Cloud Run demo deployment requires `MCP_AUTH_MODE=demo` in the environment before the first deployment. Demo mode has no application authentication, so the script keeps the service private: it deploys with `--no-allow-unauthenticated` and adds no `allUsers` binding. Grant `roles/run.invoker` to named principals to reach it.
+For a new service, the script:
 
-Updates to an existing service read the deployed `MCP_AUTH_MODE` and apply the same rule, so a demo service never becomes publicly invocable through a redeploy. If the service lookup fails for any reason other than a missing service, the script stops instead of bootstrapping over a running deployment.
+1. Creates a private bootstrap revision with a loopback URL.
+2. Gets Cloud Run's canonical service URL.
+3. Updates `BASE_URL` on a new revision before switching traffic.
+4. Grants `allUsers` the Cloud Run invoker role only after these steps, and only in GitHub mode.
 
-## Client setup
+The initial revision uses private Identity and Access Management (IAM) permissions.
+This is necessary because `gcloud` does not support `--no-traffic` when creating a service.
+MCP clients and browser redirects need public network access. The application enforces GitHub authentication.
 
-Use the deployed `/mcp` URL in an MCP client that supports remote OAuth. For Claude, follow Anthropic's maintained [custom connector guide](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp): individual users start under Customize > Connectors, while organization administrators use Organization settings.
+For an existing service, the script updates `BASE_URL` and `MCP_APP`.
+It preserves unrelated environment variables and Secret Manager bindings.
 
-The repository tests protocol discovery and a real HTTP MCP flow. Maintainers have not run this release against live GitHub OAuth, Claude, or Cloud Run credentials.
+### Storage and scaling limits
+
+**Use shared, durable, encrypted storage before you enable scaling or rely on OAuth state across revisions.**
+
+The script limits the service to one instance because the default OAuth store is local to that instance.
+This reduces steady-state concurrency, but Cloud Run rollouts can overlap revisions.
+Local state disappears on restart, including after scale-to-zero.
+
+The reference script allows scale-to-zero to avoid idle compute charges.
+It does not provision shared storage or Secret Manager.
+
+### Private demo deployments
+
+Set `MCP_AUTH_MODE=demo` in your environment before the first demo deployment.
+Demo mode has no application authentication.
+The script keeps the service private with `--no-allow-unauthenticated` and adds no `allUsers` binding.
+Grant `roles/run.invoker` to named principals who need access.
+
+For existing services, the script reads the deployed `MCP_AUTH_MODE` and applies the same access rule.
+A redeploy therefore does not make a demo service publicly invocable.
+If a service lookup fails, the script stops unless the error identifies a missing service.
+This prevents it from bootstrapping over a running deployment.
+
+## Public API
+
+### Create the HTTP application
+
+```text
+create_app(mcp: FastMCP, *, allow_anonymous: bool = False,
+           cors_origins: list[str] | None = None)
+```
+
+`create_app`:
+
+- Serves stateless JSON MCP transport at `/mcp`.
+- Adds the `/health` route.
+- Rejects an MCP server without authentication unless `allow_anonymous=True`.
+
+The default browser origin for cross-origin resource sharing (CORS) is `https://claude.ai`.
+Pass exact origins through `cors_origins` for other browser clients.
+
+### Read authentication and identity
+
+| API | Behavior |
+| --- | --- |
+| `auth_from_env()` | Selects the configured authentication mode |
+| `GitHubAuthProvider` | Enforces the numeric-ID allowlist on each bearer request |
+| `get_current_sub()` | Returns the current request's native subject, or `None` outside an authenticated request |
+
+### Supply a custom OAuth store
+
+```text
+GitHubAuthProvider(*, allowed_user_ids: Collection[str], client_id: str,
+                   client_secret: str, base_url: str,
+                   encrypted_storage: AsyncKeyValue | None = None)
+```
+
+FastMCP encrypts its default file store.
+A store supplied through `encrypted_storage` must encrypt its values before persistence.
+
+### Call GitHub from a tool
+
+Use FastMCP's `get_access_token()` dependency to get the current upstream credential.
+Treat `AccessToken.token` as a secret:
+
+- Use it only in the outbound authorization header.
+- Keep it out of logs and tool results.
+
+## OAuth and storage model
+
+### Protocol support
+
+FastMCP provides:
+
+- Client registration and Proof Key for Code Exchange (PKCE).
+- Downstream consent and browser-bound state.
+- Client and redirect binding.
+- Token issuance and protected-resource discovery.
+
+The provider supports Client ID Metadata Documents and Dynamic Client Registration for compatible MCP clients.
+The lockfile pins FastMCP 4.0.3 and MCP SDK 2.2.0.
+This stack negotiates MCP protocol version `2025-11-25` in the repository's HTTP tests.
+See the [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/) for the broader protocol contract.
+
+### Tokens and persistence
+
+The server issues one-hour FastMCP access tokens.
+It checks GitHub access without an upstream verification cache.
+
+By default, FastMCP stores registrations and token mappings in an encrypted file store under `FASTMCP_HOME`.
+A custom store must provide encryption itself.
+
+### Revocation and reconnection
+
+GitHub does not expose an OAuth token-revocation endpoint for this provider.
+The server therefore does not advertise a local `/revoke` route.
+To invalidate a GitHub credential, revoke the OAuth app grant in the user's GitHub application settings.
+
+The MCP client may need to reconnect after token expiry, revocation, a new revision, or loss of local storage.
+Client refresh behavior varies. This project does not promise an automatic refresh flow.
+
+### Public-service operations
+
+MCP clients and browsers must be able to reach the dynamic client registration and consent endpoints.
+This template does not add ingress rate limits, registration quotas, or storage monitoring.
+
+For an internet-facing service:
+
+- Apply abuse controls at the network edge.
+- Set an operational policy for storage growth and retention.
 
 ## Development
 
-Run the full local quality suite:
+Run the local quality suite:
 
 ```bash
 uv sync --frozen --group dev
 make check
 ```
 
-`make check` runs Ruff lint and formatting checks, ty, pytest, and a dependency advisory audit. CI also tests Python 3.12 through 3.14, builds the wheel and source distribution, runs tests from the source archive, checks ShellCheck, and smoke-tests the container.
+`make check` runs Ruff lint and formatting checks, ty, pytest, and a dependency advisory audit.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for change guidance, [SECURITY.md](SECURITY.md) for private vulnerability reports, and [CHANGELOG.md](CHANGELOG.md) for release history.
+CI also:
+
+- Tests Python 3.12 through 3.14.
+- Builds the wheel and source distribution.
+- Runs tests from the source archive.
+- Checks ShellCheck.
+- Smoke-tests the container.
+
+| Document | Purpose |
+| --- | --- |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Change guidance |
+| [SECURITY.md](SECURITY.md) | Private vulnerability reports |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ## License
 
