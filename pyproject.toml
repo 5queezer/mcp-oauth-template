@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-oauth-template"
-version = "0.3.0"
+version = "0.3.1"
 description = "A Python MCP template with GitHub OAuth, explicit access policy, and HTTP deployment"
 readme = "README.md"
 license = "MIT"

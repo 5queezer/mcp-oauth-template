@@ -37,3 +37,24 @@ Update the README and changelog when a change affects setup, configuration, depl
 Describe the problem, the resulting behavior, and the commands you ran. Call out security assumptions, storage requirements, and validation gaps that a reviewer cannot infer from the diff. CI must pass before merge.
 
 Report vulnerabilities through the private process in [SECURITY.md](SECURITY.md), not a public issue.
+
+## Releases
+
+CI creates a GitHub release after all checks pass on `main`.
+The release tag is `v` followed by the version in `pyproject.toml`.
+If that release already exists, CI skips publication.
+Pull request checks do not publish releases.
+
+To prepare a release:
+
+1. Change the package version in `pyproject.toml` using `major.minor.patch` format.
+2. Run `uv lock` to update the package version in `uv.lock`.
+3. Record the changes in `CHANGELOG.md`.
+4. Open a pull request and merge it after the checks pass.
+
+CI tags the commit that passed its checks and generates release notes on GitHub.
+GitHub provides source archives for the tag. This workflow does not publish to PyPI.
+If no release exists, an existing tag must point directly to the tested commit.
+An annotated tag or a tag for another commit stops publication.
+Protect release tags against manual changes in the repository rules.
+If publication fails, correct the cause and rerun the failed CI job.
