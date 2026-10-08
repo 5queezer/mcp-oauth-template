@@ -18,13 +18,13 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "fastmcp>=4.0.3,<5",
+    "fastmcp>=4.0.11,<5",
     "httpx>=0.28.1,<0.29",
-    "mcp>=2.2.0,<3",
+    "mcp>=2.3.0,<3",
     "pydantic>=2.13.5,<3",
-    "py-key-value-aio>=0.4.5,<0.5",
+    "py-key-value-aio>=0.4.6,<0.5",
     "python-multipart>=0.0.32,<0.1",
-    "starlette>=1.6.0,<2",
+    "starlette>=1.7.0,<2",
     "uvicorn[standard]>=0.52.4,<1",
 ]
 
@@ -35,10 +35,10 @@ Changelog = "https://github.com/5queezer/mcp-oauth-template/blob/main/CHANGELOG.
 
 [dependency-groups]
 dev = [
-    "httpx2==2.12.0",
+    "httpx2==2.13.1",
     "pytest>=9.1.1,<10",
-    "ruff==0.16.7",
-    "ty==0.0.80",
+    "ruff==0.16.10",
+    "ty==0.0.85",
     "pip-audit>=2.10.1,<3",
 ]
 

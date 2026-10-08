@@ -33,7 +33,7 @@ For local development, install:
 You also need Docker for container checks, or Google Cloud CLI for the optional Cloud Run deployment.
 
 The committed `uv.lock` defines the tested dependencies. Package metadata allows compatible FastMCP 4.x releases.
-CI installs the lockfile with `--frozen` and uv 0.12.12.
+CI installs the lockfile with `--frozen` and uv 0.12.23.
 
 ## Local quick start
 
@@ -352,7 +352,7 @@ FastMCP provides:
 - Token issuance and protected-resource discovery.
 
 The provider supports Client ID Metadata Documents and Dynamic Client Registration for compatible MCP clients.
-The lockfile pins FastMCP 4.0.3 and MCP SDK 2.2.0.
+The lockfile pins FastMCP 4.0.11 and MCP SDK 2.3.0.
 This stack negotiates MCP protocol version `2025-11-25` in the repository's HTTP tests.
 See the [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/) for the broader protocol contract.
 
