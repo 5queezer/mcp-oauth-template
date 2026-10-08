@@ -2,6 +2,19 @@
 
 This project records user-visible changes in this file.
 
+## Unreleased
+
+### Security
+
+- Update locked PyJWT to 2.15.1 and urllib3 to 2.8.0 to resolve `pip-audit` advisories against 2.13.0 and 2.7.0.
+
+### Changed
+
+- Raise the minimum FastMCP to 4.0.11, MCP SDK to 2.3.0, Starlette to 1.7.0, and py-key-value-aio to 0.4.6, and refresh the lockfile.
+- Update the pinned dev tools to Ruff 0.16.10, ty 0.0.85, and httpx2 2.13.1.
+- Update container images to uv 0.12.23 and the current Python 3.14 slim-bookworm digest; CI now uses uv 0.12.23 and `astral-sh/setup-uv` 10.2.0.
+- Group Dependabot version and security updates into one pull request per ecosystem.
+
 ## 0.3.1 - 2026-09-14
 
 - Make the README easier to navigate and follow.
