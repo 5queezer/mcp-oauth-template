@@ -35,10 +35,10 @@ Changelog = "https://github.com/5queezer/mcp-oauth-template/blob/main/CHANGELOG.
 
 [dependency-groups]
 dev = [
-    "httpx2==2.13.1",
+    "httpx2==2.16.0",
     "pytest>=9.1.1,<10",
-    "ruff==0.16.10",
-    "ty==0.0.85",
+    "ruff==0.17.2",
+    "ty==0.0.91",
     "pip-audit>=2.10.1,<3",
 ]
 
